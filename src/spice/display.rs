@@ -20,6 +20,10 @@
 //! Only surfaces are tracked: the primary surface (id 0) is what [`DisplayCapture::png`]
 //! returns. Every draw is converted to RGB on the way in, so the guest's surface
 //! format never has to be a specific one.
+//!
+//! As in `proto.rs`, the message-value table below is deliberately complete: a
+//! value that only the unit tests read is not dead code.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 

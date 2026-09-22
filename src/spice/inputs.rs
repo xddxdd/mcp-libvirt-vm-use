@@ -10,6 +10,10 @@
 //! `docs/spice-protocol/enums.h` rather than importing them from
 //! [`crate::spice::proto`], so this module does not depend on how `proto.rs` names
 //! its constants. All integers are little-endian on the wire.
+//!
+//! As in `proto.rs`, the value tables below are deliberately complete: a value
+//! that only a sibling module or the unit tests read is not dead code.
+#![allow(dead_code)]
 
 use crate::spice::Button;
 

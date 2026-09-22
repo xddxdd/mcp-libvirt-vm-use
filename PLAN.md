@@ -157,7 +157,7 @@ All integers are **little-endian** on the wire.
 ### Main channel (SPICE_CHANNEL_MAIN = 1)
 
 After auth OK, server sends `SPICE_MSG_MAIN_INIT` (103):
-{session_id u32, display_channels_hint u32, supported_mouse_modes u16, current_mouse_mode u16,
+{session_id u32, display_channels_hint u32, supported_mouse_modes u32, current_mouse_mode u32,
 agent_connected u32, agent_tokens u32, multi_media_time u32, ram_hint u32}.
 **session_id is the connection_id** child channels must pass in their LinkMess.
 If `supported_mouse_modes & SPICE_MOUSE_MODE_CLIENT (0x2)` and current mode ≠ CLIENT, send
