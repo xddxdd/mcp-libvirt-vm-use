@@ -3,14 +3,19 @@
 //! All integers on the SPICE wire are little-endian. Constant values come from
 //! `docs/enums.h` (the generated `spice/enums.h` from spice-protocol) and are
 //! cross-checked against the working minimal client in `docs/spice-html5/enums.js`.
+//!
+//! The tables below are deliberately complete, as PLAN.md requires: a value that
+//! only a sibling module or the unit tests read is not dead code, so the
+//! `dead_code` lint is off for this protocol reference table.
+#![allow(dead_code)]
 
 // ---------------------------------------------------------------------------
 // Link handshake
 // ---------------------------------------------------------------------------
 
-/// `SPICE_MAGIC_CONST("REDQ")`: the 4 ASCII bytes 'R','E','D','Q' read as a
-/// little-endian u32.
-pub const SPICE_MAGIC: u32 = 0x5144_4452;
+/// `SPICE_MAGIC_CONST("REDQ")`: the 4 ASCII bytes 'R','E','D','Q' packed
+/// little-endian (see `SPICE_MAGIC_CONST` in `docs/macros.h`).
+pub const SPICE_MAGIC: u32 = 0x5144_4552;
 pub const SPICE_VERSION_MAJOR: u32 = 2;
 pub const SPICE_VERSION_MINOR: u32 = 2;
 

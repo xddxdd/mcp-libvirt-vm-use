@@ -102,22 +102,8 @@ impl Channel {
         }
     }
 
-    pub fn channel_type(&self) -> u8 {
-        self.channel_type
-    }
-
-    pub fn connection_id(&self) -> u32 {
-        self.connection_id
-    }
-
     fn name(&self) -> &'static str {
-        match self.channel_type {
-            proto::CHANNEL_MAIN => "main",
-            proto::CHANNEL_DISPLAY => "display",
-            proto::CHANNEL_INPUTS => "inputs",
-            proto::CHANNEL_CURSOR => "cursor",
-            _ => "unknown",
-        }
+        channel_name(self.channel_type)
     }
 
     /// Send one message: `SpiceMiniDataHeader` (type u16, size u32) + body.
@@ -245,8 +231,9 @@ impl Channel {
         let mut chunk = [0u8; 8192];
         match self.stream.read(&mut chunk) {
             Ok(0) => Err(format!(
-                "SPICE {} channel closed by the server",
-                self.name()
+                "SPICE {} channel (connection {}) closed by the server",
+                self.name(),
+                self.connection_id
             )),
             Ok(n) => {
                 self.pending.extend_from_slice(&chunk[..n]);
@@ -323,27 +310,25 @@ impl SpiceSession {
         let mut main = Channel::new(stream, proto::CHANNEL_MAIN, 0);
 
         let deadline = Instant::now() + MAIN_INIT_TIMEOUT;
+        let no_main_init = || {
+            format!(
+                "SPICE main channel: no MAIN_INIT from {} within {}s",
+                endpoint.describe(),
+                MAIN_INIT_TIMEOUT.as_secs()
+            )
+        };
         let init = loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
-                    "SPICE main channel: no MAIN_INIT from {} within {}s",
-                    endpoint.describe(),
-                    MAIN_INIT_TIMEOUT.as_secs()
-                ));
+                return Err(no_main_init());
             }
-            match main.recv_msg_opt(remaining)? {
-                Some((proto::MSG_MAIN_INIT, body)) => break body,
+            match main.recv_msg(remaining) {
+                Ok((proto::MSG_MAIN_INIT, body)) => break body,
                 // Anything else (mouse mode, agent tokens, ...) can arrive
                 // before MAIN_INIT and does not matter yet.
-                Some(_) => continue,
-                None => {
-                    return Err(format!(
-                        "SPICE main channel: no MAIN_INIT from {} within {}s",
-                        endpoint.describe(),
-                        MAIN_INIT_TIMEOUT.as_secs()
-                    ))
-                }
+                Ok(_) => continue,
+                Err(e) if e == RECV_TIMEOUT_ERROR => return Err(no_main_init()),
+                Err(e) => return Err(e),
             }
         };
 
@@ -380,16 +365,19 @@ impl SpiceSession {
                 if remaining.is_zero() {
                     break;
                 }
-                match main.recv_msg_opt(remaining)? {
-                    Some((proto::MSG_MAIN_MOUSE_MODE, body)) => {
+                match main.recv_msg(remaining) {
+                    Ok((proto::MSG_MAIN_MOUSE_MODE, body)) => {
                         let mut mr = Reader::new(&body);
                         let _supported = mr.u16();
                         let current = mr.u16();
                         mouse_mode = u32::from(current) & proto::MOUSE_MODE_MASK;
                         break;
                     }
-                    Some(_) => continue,
-                    None => break,
+                    Ok(_) => continue,
+                    // The server stays silent when it denies the switch; we
+                    // keep the server mouse mode it reported in MAIN_INIT.
+                    Err(e) if e == RECV_TIMEOUT_ERROR => break,
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -434,8 +422,7 @@ impl SpiceSession {
             match ch.recv_msg_opt(SCREENSHOT_POLL)? {
                 Some((msg_type, body)) => {
                     last_message = Instant::now();
-                    let mut r = Reader::new(&body);
-                    capture.handle_message(msg_type, &body, &mut r)?;
+                    capture.handle_message(msg_type, &body)?;
                 }
                 None => {
                     if last_message.elapsed() >= quiet {
@@ -457,9 +444,9 @@ impl SpiceSession {
     }
 
     /// Type text using the US keyboard layout. `interval_ms` is the delay
-    /// between keystrokes.
+    /// between keystrokes. Text the US layout cannot produce is rejected.
     pub fn type_text(&mut self, text: &str, interval_ms: u64) -> Result<(), String> {
-        let events = inputs::type_text_events(text, interval_ms);
+        let events = inputs::try_type_text_events(text, interval_ms)?;
         if events.is_empty() {
             return Ok(());
         }
@@ -511,7 +498,7 @@ impl SpiceSession {
             if i > 0 {
                 thread::sleep(DOUBLE_CLICK_GAP);
             }
-            let mask = button_mask(button);
+            let mask = inputs::button_mask(button);
             ch.send_msg(
                 proto::MSGC_INPUTS_MOUSE_PRESS,
                 &inputs::mouse_press_payload(button, mask),
@@ -539,12 +526,12 @@ impl SpiceSession {
         for _ in 0..clicks {
             ch.send_msg(
                 proto::MSGC_INPUTS_MOUSE_PRESS,
-                &mouse_button_payload(button, 0),
+                &inputs::mouse_press_code_payload(button, 0),
             )?;
             thread::sleep(EVENT_GAP);
             ch.send_msg(
                 proto::MSGC_INPUTS_MOUSE_RELEASE,
-                &mouse_button_payload(button, 0),
+                &inputs::mouse_release_code_payload(button, 0),
             )?;
             thread::sleep(EVENT_GAP);
         }
@@ -554,7 +541,7 @@ impl SpiceSession {
     /// Press the left button at `from`, move to `to` in steps, release.
     pub fn mouse_drag(&mut self, from: (u32, u32), to: (u32, u32)) -> Result<(), String> {
         let mut ch = self.open_channel(proto::CHANNEL_INPUTS)?;
-        let mask = button_mask(Button::Left);
+        let mask = inputs::button_mask(Button::Left);
 
         self.send_pointer(&mut ch, from.0, from.1, 0)?;
         thread::sleep(CLICK_GAP);
@@ -581,11 +568,7 @@ impl SpiceSession {
     }
 
     /// Send an already-built event sequence (delay_ms, msg_type, payload).
-    fn send_events(
-        &mut self,
-        ch: &mut Channel,
-        events: &[(u16, u16, Vec<u8>)],
-    ) -> Result<(), String> {
+    fn send_events(&self, ch: &mut Channel, events: &[(u16, u16, Vec<u8>)]) -> Result<(), String> {
         for (delay_ms, msg_type, payload) in events {
             if *delay_ms > 0 {
                 thread::sleep(Duration::from_millis(u64::from(*delay_ms)));
@@ -619,17 +602,27 @@ impl SpiceSession {
 
     /// Consume messages the server already sent (acks, pings, inputs
     /// notifications) so the ack window does not stall the channel.
-    fn drain(&mut self, ch: &mut Channel) -> Result<(), String> {
+    fn drain(&self, ch: &mut Channel) -> Result<(), String> {
         while ch.recv_msg_opt(DRAIN_POLL)?.is_some() {}
+        Ok(())
+    }
+
+    /// Respond to whatever the main channel sent while we were idle. The main
+    /// channel must stay healthy for the whole session, so pings and ack
+    /// windows are serviced before every child-channel operation.
+    fn pump_main(&mut self) -> Result<(), String> {
+        while self.main.recv_msg_opt(DRAIN_POLL)?.is_some() {}
         Ok(())
     }
 
     /// Open a child channel: fresh connection, link handshake with the main
     /// channel's session id.
-    fn open_channel(&self, channel_type: u8) -> Result<Channel, String> {
-        let mut stream = self.endpoint.connect().map_err(|e| {
-            format!("SPICE {} ({}): {}", channel_name(channel_type), channel_type, e)
-        })?;
+    fn open_channel(&mut self, channel_type: u8) -> Result<Channel, String> {
+        self.pump_main()?;
+        let mut stream = self
+            .endpoint
+            .connect()
+            .map_err(|e| format!("SPICE {} channel: {}", channel_name(channel_type), e))?;
         link::link_connect(
             &mut stream,
             self.session_id,
@@ -649,23 +642,6 @@ fn channel_name(channel_type: u8) -> &'static str {
         proto::CHANNEL_CURSOR => "cursor",
         _ => "unknown",
     }
-}
-
-/// `SpiceMouseButtonMask` for the tools' three buttons.
-fn button_mask(button: Button) -> u16 {
-    match button {
-        Button::Left => proto::MOUSE_BUTTON_MASK_LEFT,
-        Button::Middle => proto::MOUSE_BUTTON_MASK_MIDDLE,
-        Button::Right => proto::MOUSE_BUTTON_MASK_RIGHT,
-    }
-}
-
-/// Wire body of `SPICE_MSGC_INPUTS_MOUSE_PRESS` / `_RELEASE`.
-fn mouse_button_payload(button: u8, buttons_state: u16) -> Vec<u8> {
-    let mut w = proto::Writer::new();
-    w.u8(button);
-    w.u16(buttons_state);
-    w.into_vec()
 }
 
 fn clamp_i32(v: i64) -> i32 {
@@ -784,31 +760,12 @@ mod tests {
     }
 
     #[test]
-    fn button_masks_match_protocol_header() {
-        assert_eq!(button_mask(Button::Left), 1);
-        assert_eq!(button_mask(Button::Middle), 2);
-        assert_eq!(button_mask(Button::Right), 4);
-    }
-
-    #[test]
-    fn mouse_button_payload_is_three_bytes() {
-        assert_eq!(
-            mouse_button_payload(proto::MOUSE_BUTTON_UP, 0),
-            vec![4, 0x00, 0x00]
-        );
-        assert_eq!(
-            mouse_button_payload(proto::MOUSE_BUTTON_LEFT, 1),
-            vec![1, 0x01, 0x00]
-        );
-    }
-
-    #[test]
     fn interpolation_reaches_both_endpoints() {
         assert_eq!(interpolate(0, 100, 0, 8), 0);
         assert_eq!(interpolate(0, 100, 8, 8), 100);
         assert_eq!(interpolate(100, 0, 4, 8), 50);
         assert_eq!(interpolate(10, 20, 1, 10), 11);
-        assert_eq!(interpolate(u32::MAX, 0, 1, 2), (u32::MAX / 2) as u32);
+        assert_eq!(interpolate(u32::MAX, 0, 1, 2), 2_147_483_648);
     }
 
     #[test]

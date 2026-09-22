@@ -109,11 +109,16 @@ impl Write for Stream {
 }
 
 /// Parsed `SpiceLinkReply` (the server's answer to our `SpiceLinkMess`).
+#[derive(Debug)]
 pub struct LinkReply {
     pub error: u32,
     /// Raw `pub_key[162]` field (a DER SubjectPublicKeyInfo, zero padded).
     pub pub_key: Vec<u8>,
     pub common_caps: Vec<u32>,
+    /// The server's channel capabilities. This client requests no channel
+    /// capability (raw display images instead of a compression cap), so the
+    /// values are parsed for completeness and for the unit tests.
+    #[allow(dead_code)]
     pub channel_caps: Vec<u32>,
 }
 
@@ -422,6 +427,20 @@ pub fn link_connect(
             proto::link_error_text(reply.error)
         ));
     }
+    // Everything after the handshake is framed with SpiceMiniDataHeader, which
+    // only works if the server offers the same capability we advertised.
+    if reply
+        .common_caps
+        .first()
+        .map_or(0, |caps| caps & (1 << proto::COMMON_CAP_MINI_HEADER))
+        == 0
+    {
+        return Err(format!(
+            "SPICE server does not offer the mini header capability (common caps {:?}); \
+             this client only understands mini-header framing",
+            reply.common_caps
+        ));
+    }
 
     let (n, e) = parse_der_pubkey(&reply.pub_key)?;
     let ticket = oaep_encrypt_ticket(password, &n, &e)?;
@@ -537,7 +556,8 @@ mod tests {
     #[test]
     fn link_mess_main_channel_has_no_channel_caps() {
         let mess = build_link_mess(0, proto::CHANNEL_MAIN, &[]);
-        assert_eq!(mess.len(), 18);
+        // 18-byte fixed part plus the single common capability word.
+        assert_eq!(mess.len(), 22);
         assert_eq!(&mess[14..18], &18u32.to_le_bytes());
     }
 
@@ -550,7 +570,7 @@ mod tests {
         body.extend_from_slice(&der);
         body.extend_from_slice(&1u32.to_le_bytes()); // num_common_caps
         body.extend_from_slice(&1u32.to_le_bytes()); // num_channel_caps
-        body.extend_from_slice(&18u32.to_le_bytes()); // caps_offset
+        body.extend_from_slice(&178u32.to_le_bytes()); // caps_offset: sizeof(SpiceLinkReply)
         body.extend_from_slice(&0b1001u32.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes());
 
@@ -561,8 +581,12 @@ mod tests {
         assert_eq!(reply.channel_caps, vec![0]);
 
         assert!(parse_link_reply(&body[..100]).is_err());
+        // caps_offset is the last u32 of the fixed part:
+        // error u32 + pub_key[162] + num_common u32 + num_channel u32.
+        let caps_offset_at = 4 + proto::SPICE_TICKET_PUBKEY_BYTES + 8;
         let mut bad = body.clone();
-        bad[14..18].copy_from_slice(&(body.len() as u32 + 8).to_le_bytes());
+        bad[caps_offset_at..caps_offset_at + 4]
+            .copy_from_slice(&(body.len() as u32 + 8).to_le_bytes());
         assert!(parse_link_reply(&bad).is_err());
     }
 
@@ -615,5 +639,98 @@ mod tests {
         assert!(text.contains("wrong password"), "got: {}", text);
         assert!(auth_error_text(proto::LINK_ERR_CHANNEL_NOT_AVAILABLE)
             .contains("CHANNEL_NOT_AVAILABLE"));
+    }
+
+    /// The server side of the ticket exchange: the password plus a NUL byte
+    /// must come back out of the RSA-OAEP(SHA-1) ciphertext.
+    #[test]
+    fn oaep_ticket_decrypts_to_password_plus_nul() {
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::RsaPrivateKey;
+
+        let mut rng = rand::rngs::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 1024).expect("RSA keygen");
+        let public = RsaPublicKey::from(&private);
+        let spki = public
+            .to_public_key_der()
+            .expect("encode SPKI")
+            .as_bytes()
+            .to_vec();
+        assert!(spki.len() <= proto::SPICE_TICKET_PUBKEY_BYTES);
+
+        let (n, e) = parse_der_pubkey(&spki).expect("SPKI should parse");
+        let ciphertext = oaep_encrypt_ticket("hunter2", &n, &e).expect("encrypt");
+        let plaintext = private
+            .decrypt(Oaep::new::<Sha1>(), &ciphertext)
+            .expect("decrypt");
+        assert_eq!(plaintext, b"hunter2\0".to_vec());
+    }
+
+    /// Full handshake against a fake in-process server over a socketpair:
+    /// header/link message bytes, reply parsing, ticket exchange and the
+    /// auth result handling.
+    #[test]
+    fn link_connect_round_trip_and_permission_denied() {
+        let der = decode_hex(TEST_SPKI_HEX);
+        for auth_code in [proto::LINK_ERR_OK, proto::LINK_ERR_PERMISSION_DENIED] {
+            let (client, server) = UnixStream::pair().expect("socketpair");
+            server
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("read timeout");
+            let der = der.clone();
+            let fake_server = std::thread::spawn(move || -> Vec<Vec<u8>> {
+                let mut s = Stream::Unix(server);
+                let mut header = [0u8; 16];
+                s.read_exact(&mut header).expect("link header");
+                let size =
+                    u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+                let mut mess = vec![0u8; size];
+                s.read_exact(&mut mess).expect("link mess");
+
+                let mut body = Vec::new();
+                body.extend_from_slice(&0u32.to_le_bytes()); // error = OK
+                body.extend_from_slice(&der);
+                body.extend_from_slice(&1u32.to_le_bytes()); // num_common_caps
+                body.extend_from_slice(&0u32.to_le_bytes()); // num_channel_caps
+                body.extend_from_slice(&178u32.to_le_bytes()); // caps_offset
+                body.extend_from_slice(&0b1001u32.to_le_bytes());
+                let reply_header = build_link_header(body.len() as u32);
+                s.write_all(&reply_header).expect("reply header");
+                s.write_all(&body).expect("reply body");
+                s.flush().expect("flush reply");
+
+                let mut ticket = [0u8; 4 + proto::SPICE_TICKET_KEY_BYTES];
+                s.read_exact(&mut ticket).expect("auth ticket");
+                s.write_all(&auth_code.to_le_bytes()).expect("auth code");
+                s.flush().expect("flush auth");
+                vec![header.to_vec(), mess, ticket.to_vec()]
+            });
+
+            let mut stream = Stream::Unix(client);
+            let result = link_connect(&mut stream, 0, proto::CHANNEL_MAIN, &[], "hunter2");
+            let seen = fake_server.join().expect("fake server thread");
+
+            assert_eq!(&seen[0][0..4], b"REDQ");
+            assert_eq!(&seen[0][4..8], &2u32.to_le_bytes());
+            assert_eq!(&seen[0][8..12], &2u32.to_le_bytes());
+            assert_eq!(&seen[1][0..4], &0u32.to_le_bytes()); // connection_id
+            assert_eq!(seen[1][4], proto::CHANNEL_MAIN);
+            assert_eq!(&seen[1][6..10], &1u32.to_le_bytes());
+            assert_eq!(&seen[1][14..18], &18u32.to_le_bytes());
+            assert_eq!(&seen[2][0..4], &proto::AUTH_MECHANISM_SPICE.to_le_bytes());
+            assert_eq!(seen[2].len(), 4 + proto::SPICE_TICKET_KEY_BYTES);
+
+            match auth_code {
+                proto::LINK_ERR_OK => {
+                    let reply = result.expect("handshake should succeed");
+                    assert_eq!(reply.error, proto::LINK_ERR_OK);
+                    assert_eq!(reply.common_caps, vec![0b1001]);
+                }
+                _ => {
+                    let err = result.expect_err("handshake should fail");
+                    assert!(err.contains("wrong password"), "got: {}", err);
+                }
+            }
+        }
     }
 }

@@ -82,7 +82,7 @@ impl Channel {
     pub fn recv_msg(&mut self, timeout: Duration) -> Result<(u16, Vec<u8>), String>;   // handles SET_ACK/PING internally
 }
 // channel types:
-pub const CHANNEL_MAIN: u8 = 1; pub const CHANNEL_DISPLAY: u8 = 3; pub const CHANNEL_INPUTS: u8 = 2;
+pub const CHANNEL_MAIN: u8 = 1; pub const CHANNEL_DISPLAY: u8 = 2; pub const CHANNEL_INPUTS: u8 = 3;
 
 // spice/inputs.rs (C) — functions called by B's mod.rs:
 pub fn try_type_text_events(text: &str, interval_ms: u64) -> Result<Vec<(u16 /*delay_ms*/, u16 /*msg_type*/, Vec<u8>)>, String>;  // rejects non-ASCII; B calls THIS from SpiceSession::type_text
@@ -100,7 +100,7 @@ pub struct DisplayCapture { /* framebuffer + image cache (C-owned) */ }
 impl DisplayCapture {
     pub fn new() -> Self;
     /// Process one display-channel server message body; returns Ok(()) or Err on fatal.
-    pub fn handle_message(&mut self, msg_type: u16, body: &[u8], r: &mut Reader…) -> Result<(), String>;
+    pub fn handle_message(&mut self, msg_type: u16, body: &[u8]) -> Result<(), String>;
     pub fn png(&self) -> Option<PngImage>;   // Some once surface 0 has been fully drawn at least once
 }
 pub fn display_init_payload(cache_id: u8) -> Vec<u8>;      // SPICE_MSGC_DISPLAY_INIT body
@@ -161,10 +161,10 @@ After auth OK, server sends `SPICE_MSG_MAIN_INIT` (103):
 agent_connected u32, agent_tokens u32, multi_media_time u32, ram_hint u32}.
 **session_id is the connection_id** child channels must pass in their LinkMess.
 If `supported_mouse_modes & SPICE_MOUSE_MODE_CLIENT (0x2)` and current mode ≠ CLIENT, send
-`SPICE_MSGC_MAIN_MOUSE_MODE_REQUEST` (105): {mode u32 = 2}. Keep main channel open while
+`SPICE_MSGC_MAIN_MOUSE_MODE_REQUEST` (105): {mode u16 = 2} (flags16 mouse_mode). Keep main channel open while
 child channels run (respond to ping/ack).
 
-### Inputs channel (SPICE_CHANNEL_INPUTS = 2)
+### Inputs channel (SPICE_CHANNEL_INPUTS = 3)
 
 Client messages (mini header + body):
 - `SPICE_MSGC_INPUTS_KEY_DOWN` (101): {code u32}
@@ -189,7 +189,7 @@ Client messages (mini header + body):
   home, end, pgup, pageup, pgdn, pagedown, up/down/left/right, f1..f12, capslock, numlock,
   printscreen, pause, a–z, 0–9, and symbols via US-layout mapping.
 
-### Display channel (SPICE_CHANNEL_DISPLAY = 3)
+### Display channel (SPICE_CHANNEL_DISPLAY = 2)
 
 Immediately after auth OK:
 1. Send `SPICE_MSGC_DISPLAY_INIT` (101): {pixmap_cache_id u8 = 1, pixmap_cache_size i64 = 10*1024*1024,
@@ -200,9 +200,9 @@ Immediately after auth OK:
    need QUIC/GLZ/LZ decoders.
 
 Server messages to handle (see `docs/spice-html5/display.js` for working logic):
-- `SPICE_MSG_SURFACE_CREATE` (318): {surface_id u32, width u32, height u32, format u32, flags u32}
+- `SPICE_MSG_SURFACE_CREATE` (314): {surface_id u32, width u32, height u32, format u32, flags u32}
   → allocate RGB framebuffer (surface 0 = primary).
-- `SPICE_MSG_SURFACE_DESTROY` (319) → drop surface.
+- `SPICE_MSG_SURFACE_DESTROY` (315) → drop surface.
 - `SPICE_MSG_DISPLAY_MARK` (102) → mark "need full redraw"; server follows with full-screen draw commands.
 - `SPICE_MSG_DISPLAY_MODE` (101), `SPICE_MSG_DISPLAY_RESET` (103) → reset state.
 - `SPICE_MSG_DISPLAY_COPY_BITS` (104): {DisplayBase, src_pos Point} — move pixels within framebuffer.
@@ -210,8 +210,8 @@ Server messages to handle (see `docs/spice-html5/display.js` for working logic):
   → fill rect with color. DisplayBase = {surface_id u32, box Rect(top,left,bottom,right), clip type u8 + rects}.
   Mask on the wire: {flags u8, pos Point(x,y), then an Image descriptor (id u64, type u8, flags u8,
   width u32, height u32) — a null mask is a descriptor with id 0/type 0; then no image body}.
-- `SPICE_MSG_DISPLAY_DRAW_COPY` (304) / `SPICE_MSG_DISPLAY_DRAW_BLEND` (306) /
-  `DRAW_TRANSPARENT` (313) / `DRAW_ALPHA_BLEND` (314): {DisplayBase, src Image, src_area Rect,
+- `SPICE_MSG_DISPLAY_DRAW_COPY` (304) / `SPICE_MSG_DISPLAY_DRAW_BLEND` (305) /
+  `DRAW_TRANSPARENT` (312) / `DRAW_ALPHA_BLEND` (313): {DisplayBase, src Image, src_area Rect,
   [extras], mask} → blit image region into framebuffer box.
 - `SPICE_MSG_DISPLAY_DRAW_OPAQUE` (303): {DisplayBase, src Image, src_area Rect, brush, rop_descriptor u16,
   scale_mode u8, mask} → treat like copy using src image.
@@ -221,14 +221,19 @@ Server messages to handle (see `docs/spice-html5/display.js` for working logic):
   then raw pixel bytes, length = stride × y}. **No chunk header precedes the pixel data**
   (the `@chunk` annotation is virtual; verified in spice-common codegen: the demarshaller wraps the
   remaining bytes as a single synthetic chunk).
+**CRITICAL: all display message/enum numeric values come from `docs/spice-protocol/enums.h` (authoritative):
+  DRAW_BLEND=305, DRAW_BLACKNESS=306, DRAW_WHITENESS=307, DRAW_INVERS=308, DRAW_ROP3=309,
+  DRAW_STROKE=310, DRAW_TEXT=311, DRAW_TRANSPARENT=312, DRAW_ALPHA_BLEND=313, SURFACE_CREATE=314,
+  SURFACE_DESTROY=315, STREAM_DATA_SIZED=316, MONITORS_CONFIG=317, DRAW_COMPOSITE=318;
+  image types FROM_CACHE=103, FROM_CACHE_LOSSLESS=106 (4 and 9 are bitmap FORMATS 4BIT_BE/RGBA).**
 - Bitmap formats to support (convert to 24-bit RGB framebuffer): 32BIT (xrgb LE), RGBA (argb LE),
   24BIT (bgr 3 bytes), 16BIT (555 LE), 8BIT (palette indexed), 1BIT_LE/1BIT_BE (bit per pixel,
   default palette black/white when absent). Respect `SPICE_BITMAP_FLAGS_TOP_DOWN` (0x4):
   absent → rows are bottom-up.
 - Image cache: if descriptor flags & CACHE_ME (0x1), store decoded image by descriptor id;
-  type `FROM_CACHE` (4) / `FROM_CACHE_LOSSLESS` (9) → reuse cached; `SPICE_MSG_DISPLAY_INVAL_ALL_PIXMAPS`
+  type `FROM_CACHE` (103) / `FROM_CACHE_LOSSLESS` (106) → reuse cached; `SPICE_MSG_DISPLAY_INVAL_ALL_PIXMAPS`
   (106) → clear cache; `SPICE_MSG_DISPLAY_INVAL_LIST` (105) → drop listed ids.
-- Ignore (log + continue): STREAM_* (122–125), MONITORS_CONFIG (320), DRAW_COMPOSITE (321),
+- Ignore (log + continue): STREAM_* (122–126), MONITORS_CONFIG (317), DRAW_COMPOSITE (318),
   DRAW_STROKE/DRAW_TEXT/DRAW_ROP3/DRAW_BLACKNESS/WHITENESS/INVERS (log warn; if a full-frame screenshot
   turns out incomplete that's acceptable — report `png()` when surface 0 has data).
 - Unsupported image types (QUIC etc.) → error string "unsupported image type N" (should not happen
