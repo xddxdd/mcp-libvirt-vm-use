@@ -1,0 +1,45 @@
+# AGENTS.md — mcp-libvirt 项目说明
+
+Rust 实现的 MCP (Model Context Protocol) server：通过 libvirt 管理虚拟机，通过 SPICE 协议对 VM 执行屏幕截图与键鼠控制。
+
+## 架构与目录结构
+
+```
+src/
+├── main.rs          tokio 入口：构建 LibvirtTools，经 rmcp stdio serve
+├── mcp.rs           rmcp glue：工具路由、参数结构体、结果辅助函数
+├── libvirt.rs       libvirt 封装（virt crate FFI，不调用 virsh 子进程）
+├── tools.rs         8 个 MCP tools（list_domains / screenshot / type_text /
+│                    key_press / mouse_move / mouse_click / mouse_scroll / mouse_drag）
+└── spice/
+    ├── mod.rs       SpiceSession：通道生命周期、ack/ping、会话管理
+    ├── proto.rs     SPICE 线格式常量与小端 Reader/Writer
+    ├── link.rs      Link 握手、DER 公钥解析、RSA-OAEP ticket 认证、TCP/unix Stream
+    ├── inputs.rs    键盘扫描码表 + 键鼠事件构造
+    └── display.rs   显示通道捕获：draw 命令合成 → RGB framebuffer → PNG
+
+docs/                SPICE 协议权威参考（spice.proto、spice-protocol 头文件、
+                     spice-html5 参考实现、spice-server 源码片段）
+PLAN.md              约束性契约：模块 API 签名、已验证的 SPICE 线格式事实、crate 选型
+flake.nix            flake-parts devShell（rustc / cargo / pkg-config / libvirt）
+```
+
+## 构建与测试（NixOS）
+
+`virt` crate 需要 libvirt C 头文件与库，所有 cargo 命令必须在 devShell 内执行：
+
+```bash
+nix develop -c cargo build
+nix develop -c cargo test
+nix develop -c cargo run
+```
+
+宿主机 rustup 的 ld shim 损坏时，裸 cargo 链接需 `RUSTFLAGS="-C link-arg=-fuse-ld=bfd"`；devShell 内的 nixpkgs rustc 无此问题。
+
+## 开发规则
+
+- **PLAN.md 是契约**：模块公开 API、SPICE wire 语义、依赖选型都以它为准。修改模块 API 前先更新 PLAN.md。
+- **SPICE 协议数值**以 `docs/spice-protocol/enums.h` 为唯一权威（消息 ID、枚举值）。
+- **Cargo.toml 由项目所有者统一管理**；依赖选型决策（官方 `rmcp` crate 做 MCP、`virt` crate 做 libvirt、手写 SPICE 客户端）记录在 PLAN.md。
+- 每次操作（截图/输入）新建一个 SPICE 连接：main channel 获取 session_id → 按需打开 inputs/display channel → 操作后断开。
+- 截图原理：client 请求 `PREFERRED_COMPRESSION=OFF` 后服务端发送原始 BITMAP（无需 QUIC/GLZ 解码器）；bitmap 像素数据前没有 chunk 头，长度为 stride×y。
