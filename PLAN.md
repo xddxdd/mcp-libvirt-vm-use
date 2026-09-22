@@ -14,14 +14,14 @@ and send keyboard/mouse input to VMs via the SPICE protocol.
 
 ## Architecture
 
-Single binary crate `mcp-libvirt`, **synchronous** (no tokio): MCP over stdio is a serial
-JSON-RPC conversation; the SPICE client is a short-lived sync TCP/unix client per operation.
+Single binary crate `mcp-libvirt`. The MCP layer is async (`rmcp` + tokio, stdio transport);
+the SPICE client is a short-lived synchronous TCP/unix client per operation (wrapped in spawn_blocking).
 
 ```
 src/
-├── main.rs          [A] entry point: build tool registry, run MCP stdio loop
-├── mcp.rs           [A] JSON-RPC framing + MCP protocol (initialize / tools/list / tools/call)
-├── libvirt.rs       [A] virsh CLI wrapper: list domains, states, find SPICE endpoint
+├── main.rs          [A] tokio main: build LibvirtTools, serve over rmcp stdio
+├── mcp.rs           [A] rmcp glue: tool router, param structs, CallToolResult helpers
+├── libvirt.rs       [A] libvirt bindings via `virt` crate: list domains, states, find SPICE endpoint
 ├── tools.rs         [A] MCP tool schemas + dispatch: wires libvirt.rs + spice::SpiceSession
 └── spice/
     ├── mod.rs       [B] SpiceSession facade + channel lifecycle + ack/ping/common messages
@@ -85,7 +85,8 @@ impl Channel {
 pub const CHANNEL_MAIN: u8 = 1; pub const CHANNEL_DISPLAY: u8 = 3; pub const CHANNEL_INPUTS: u8 = 2;
 
 // spice/inputs.rs (C) — functions called by B's mod.rs:
-pub fn type_text_events(text: &str, interval_ms: u64) -> Vec<(u16 /*delay_ms*/, u16 /*msg_type*/, Vec<u8>)>;
+pub fn try_type_text_events(text: &str, interval_ms: u64) -> Result<Vec<(u16 /*delay_ms*/, u16 /*msg_type*/, Vec<u8>)>, String>;  // rejects non-ASCII; B calls THIS from SpiceSession::type_text
+pub fn type_text_events(text: &str, interval_ms: u64) -> Vec<(u16, u16, Vec<u8>)>;  // infallible variant
 pub fn key_combo_events(combo: &str) -> Result<Vec<(u16, u16, Vec<u8>)>, String>;
 pub fn mouse_position_payload(x: u32, y: u32, buttons: u16) -> Vec<u8>;
 pub fn mouse_press_payload(button: Button, buttons: u16) -> Vec<u8>;
@@ -238,46 +239,97 @@ compression OFF, then pump messages until either (a) quiet period of `wait_ms` (
 after MARK + at least one full-frame pass), then `DisplayCapture::png()` → `PngImage`.
 Cap total wait at ~5 s. Encode with the `png` crate (RGB 8-bit).
 
-## MCP protocol (hand-rolled JSON-RPC 2.0 over stdio, `docs/mcp.rs`)
+## MCP layer (official `rmcp` crate, stdio transport)
 
-Line-delimited JSON (`Content-Length` framing is the old style; MCP stdio uses newline-delimited
-JSON-RPC messages — one JSON object per line). Respond to:
-- `initialize` → result `{protocolVersion: <echo client's version, else "2025-06-18">, capabilities: {tools: {}}, serverInfo: {name: "mcp-libvirt", version: "0.1.0"}}`
-- `notifications/initialized` (notification, no response)
-- `tools/list` → result `{tools: [ …defs… ]}` (schema below)
-- `tools/call` params `{name, arguments}` → result `{content: [...], isError?: true}`;
-  content items: `{type: "text", text}` or `{type: "image", data: <base64 PNG>, mimeType: "image/png"}`.
-  On tool error → `{content: [{type:"text", text: "<error>"}], isError: true}`.
-- Ignore other requests with JSON-RPC error -32601 method not found; respond to `ping` with `{}`.
-- Never print anything except the JSON-RPC output on stdout (no logs to stdout; stderr allowed,
-  keep minimal).
+We reuse the official Rust MCP SDK (`rmcp` 3.x, features `transport-io` + `schemars`) instead of
+hand-rolling JSON-RPC. Worker A rewrites src/mcp.rs + src/main.rs + src/tools.rs to this model
+(API verified against the rmcp README):
+
+```rust
+use rmcp::{handler::server::wrapper::Parameters, model::{CallToolResult, ContentBlock},
+           schemars, tool, tool_router, tool_handler, ServerHandler, ServiceExt, transport::stdio};
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ScreenshotParams { domain: String, wait_ms: Option<u32> }
+
+#[derive(Clone)]
+struct LibvirtTools;   // holds the crate::libvirt::Libvirt handle
+
+#[tool_router]
+impl LibvirtTools {
+    #[tool(description = "Take a screenshot of a VM's SPICE display")]
+    async fn screenshot(&self, Parameters(ScreenshotParams { domain, wait_ms }): Parameters<ScreenshotParams>)
+        -> Result<CallToolResult, rmcp::Error> { ... }
+}
+#[tool_handler(name = "mcp-libvirt", version = "0.1.0")]
+impl ServerHandler for LibvirtTools {}
+
+#[tokio::main]
+async fn main() {
+    let service = LibvirtTools.serve(stdio()).await?;   // then service.waiting().await
+}
+```
+
+- Tool results: `Ok(CallToolResult::success(vec![ContentBlock::text(...), ContentBlock::image(base64_png, "image/png")]))`;
+  operational errors -> `Ok(CallToolResult::error(vec![ContentBlock::text("<error>")]))` (isError content),
+  protocol errors -> Err(rmcp::Error). Param structs derive `serde::Deserialize` + `schemars::JsonSchema`
+  (field docs = tool descriptions). Screenshot returns one image block + a text block with width/height.
+- Long SPICE work is synchronous: run it via `tokio::task::spawn_blocking` inside each handler.
+- src/mcp.rs may shrink to glue/re-exports or be deleted - main.rs owns the tokio main + serve call.
+  Check the vendored rmcp 3.x source in ~/.cargo/registry for exact signatures when unsure
+  (`cargo fetch` first); the macro API above is from the current SDK README.
 
 ### Tools
 
-1. `list_domains` () → text table: name, id, state, spice endpoint.
-2. `screenshot` ({domain: string, wait_ms?: number}) → image content (+ text with width/height).
-3. `type_text` ({domain, text: string, interval_ms?: number}) → text ok.
-4. `key_press` ({domain, keys: string /* "ctrl+alt+t" */}) → text ok.
-5. `mouse_move` ({domain, x: int, y: int}) → text ok.
-6. `mouse_click` ({domain, button: "left"|"middle"|"right", x?: int, y?: int, double_click?: bool}) → text ok.
-7. `mouse_scroll` ({domain, direction: "up"|"down", clicks?: int}) → text ok.
-8. `mouse_drag` ({domain, from_x, from_y, to_x, to_y}) → text ok.
+1. `list_domains` () -> text table: name, id, state, spice endpoint.
+2. `screenshot` ({domain: string, wait_ms?: number}) -> image content (+ text with width/height).
+3. `type_text` ({domain, text: string, interval_ms?: number}) -> text ok.
+4. `key_press` ({domain, keys: string /* "ctrl+alt+t" */}) -> text ok.
+5. `mouse_move` ({domain, x: int, y: int}) -> text ok.
+6. `mouse_click` ({domain, button: "left"|"middle"|"right", x?: int, y?: int, double_click?: bool}) -> text ok.
+7. `mouse_scroll` ({domain, direction: "up"|"down", clicks?: int}) -> text ok.
+8. `mouse_drag` ({domain, from_x, from_y, to_x, to_y}) -> text ok.
 
-Every input/screenshot call: resolve domain → SPICE endpoint (fresh connection per call),
+Every input/screenshot call: resolve domain -> SPICE endpoint (fresh connection per call),
 connect main channel (+ mouse mode request), open the needed child channel, perform operation,
-drop connection. Text tools describe parameters in `inputSchema` JSON Schema.
+drop connection. rmcp derives the inputSchema JSON from the param structs.
 
-## libvirt layer (virsh CLI)
+## libvirt layer (official `virt` crate - NO virsh subprocess)
 
-- `virsh --connect <uri> list --all` → parse name/state/id (name may contain spaces; parse robustly
-  by regex from the first column; name is rest of line minus trailing state; use `virsh list --all
-  --name` + per-domain `virsh domstate` instead? — simpler & robust: get names with `--name`, then
-  state via `domstate`).
-- SPICE endpoint: `virsh domdisplay <name>` → `spice://HOST:PORT` or `spice+unix:///path`
-  (also handle `spice://?socket=...`). Fallback: `virsh dumpxml <name>`, parse `<graphics type="spice"`
-  element attributes: `port`/`autoport`/`listen` and `<listen type='socket' path='...'/>`.
-  If graphics type is not spice → `spice: None`; tools report a clear error.
+The public Rust contract (Libvirt/DomainInfo/SpiceEndpoint) stays EXACTLY as in 'Public API
+contracts'; only the implementation changes: use the `virt` crate (0.4, FFI to libvirt, linked
+via the Nix devShell - see 'Build environment'). API verified against virt 0.4.3 source:
+
+```rust
+use virt::connect::Connect;
+let conn = Connect::open(Some(uri))?;                 // "qemu:///system"
+let domains = conn.list_all_domains(0)?;              // Vec<virt::domain::Domain>
+for d in domains {
+    let name = d.get_name()?;
+    let id = d.get_id();                              // Option<u32>: None when inactive
+    let (state, _reason) = d.get_state()?;            // numeric virDomainState
+    let xml = d.get_xml_desc(0)?;                     // LIVE xml: port populated when running
+}
+```
+
+- State mapping to human strings: 0 no state, 1 running, 2 blocked, 3 paused, 4 shutdown,
+  5 shut off, 6 crashed, 7 pmsuspended.
+- SPICE endpoint: parse the LIVE XML from `get_xml_desc(0)`: `<graphics type="spice" port="5900"
+listen="...">` (port present only while the VM runs; autoport VMs get their assigned port there)
+and `<listen type="socket" path="..."/>` -> `SpiceEndpoint::Unix`. If graphics type is not
+spice -> `spice: None`; tools report a clear error. Keep Worker A's existing XML-parsing helpers
+and unit tests - only swap the transport (virsh CLI -> virt crate).
 - Password: env `MCP_LIBVIRT_SPICE_PASSWORD` (optional, default empty).
+- Errors: `virt::error::Error` -> human string (include .to_string()).
+
+## Build environment (NixOS devShell - parent-managed)
+
+The `virt` crate needs libvirt C headers/libs at build time -> everything builds inside a
+flake-parts devShell: `nix develop -c cargo build`, `nix develop -c cargo test`,
+`nix develop -c cargo run`. flake.nix at the repo root provides rustc, cargo, pkg-config, libvirt.
+If a bare `cargo build` fails with header/linker errors, that is expected - use the devShell.
+(Host note: the rustup ld shim may need `-C link-arg=-fuse-ld=bfd`; nixpkgs rustc inside the
+devShell should not.)
 
 ## Cargo.toml
 
@@ -295,22 +347,27 @@ png = "0.17"
 rsa = { version = "0.9", features = ["sha1"] }
 sha1 = "0.10"
 rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+rmcp = { version = "3", features = ["transport-io", "schemars"] }
+virt = "0.4"
 ```
 
 This Cargo.toml is **created and managed by the parent** (it already exists in the repo root).
 Workers A/B/C must NOT modify it. If you believe a dependency or feature is missing,
 say so in your report instead of editing it.
 
+
 ## Task decomposition (delegated implementation)
 
-- **Worker A — scaffold + MCP + libvirt + tools** (files: Cargo.toml, src/main.rs, src/mcp.rs,
-  src/libvirt.rs, src/tools.rs). Follows contracts above; calls `crate::spice::SpiceSession`.
+- **Worker A — scaffold + MCP (rmcp) + libvirt (virt crate) + tools** (files: src/main.rs,
+  src/mcp.rs, src/libvirt.rs, src/tools.rs). Follows contracts above; calls `crate::spice::SpiceSession`.
 - **Worker B — SPICE core** (files: src/spice/mod.rs, src/spice/proto.rs, src/spice/link.rs).
   Link/auth/ack/ping/session/channel plumbing; implements `SpiceSession` methods by calling
   into `crate::spice::inputs` / `crate::spice::display` functions (contract above).
 - **Worker C — inputs + display capture** (files: src/spice/inputs.rs, src/spice/display.rs).
   Port scancode tables + display composition from docs/spice-html5.
-- **Integration worker** — after A+B+C: `cargo build` + `cargo test` green, fix all mismatches
+- **Integration worker** — after A+B+C: `nix develop -c cargo build` + `nix develop -c cargo test`
+  green, fix all mismatches against this PLAN, no redesign.
   against this PLAN, no redesign.
 
 Validation per contract: pure-logic unit tests (link message bytes, scancode table, text typing
