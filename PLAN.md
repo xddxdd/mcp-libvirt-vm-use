@@ -259,7 +259,7 @@ struct LibvirtTools;   // holds the crate::libvirt::Libvirt handle
 impl LibvirtTools {
     #[tool(description = "Take a screenshot of a VM's SPICE display")]
     async fn screenshot(&self, Parameters(ScreenshotParams { domain, wait_ms }): Parameters<ScreenshotParams>)
-        -> Result<CallToolResult, rmcp::Error> { ... }
+        -> Result<CallToolResult, rmcp::ErrorData> { ... }
 }
 #[tool_handler(name = "mcp-libvirt", version = "0.1.0")]
 impl ServerHandler for LibvirtTools {}
@@ -272,8 +272,8 @@ async fn main() {
 
 - Tool results: `Ok(CallToolResult::success(vec![ContentBlock::text(...), ContentBlock::image(base64_png, "image/png")]))`;
   operational errors -> `Ok(CallToolResult::error(vec![ContentBlock::text("<error>")]))` (isError content),
-  protocol errors -> Err(rmcp::Error). Param structs derive `serde::Deserialize` + `schemars::JsonSchema`
-  (field docs = tool descriptions). Screenshot returns one image block + a text block with width/height.
+  protocol errors -> Err(rmcp::ErrorData). (NOTE verified: rmcp 3.4.0 has ErrorData/RmcpError, there is NO rmcp::Error; protocol version is negotiated by rmcp, not echoed;
+  tool calls may be answered out of order under rmcp; stdio framing is newline-delimited JSON.)
 - Long SPICE work is synchronous: run it via `tokio::task::spawn_blocking` inside each handler.
 - src/mcp.rs may shrink to glue/re-exports or be deleted - main.rs owns the tokio main + serve call.
   Check the vendored rmcp 3.x source in ~/.cargo/registry for exact signatures when unsure

@@ -1,4 +1,8 @@
-//! MCP tool definitions and dispatch.
+//! Tool parameter schemas and the synchronous implementation of every tool.
+//!
+//! `rmcp` derives each tool's JSON Schema from these parameter structs (field
+//! doc comments become the property descriptions), and `mcp.rs` calls the
+//! functions below from `tokio::task::spawn_blocking`.
 //!
 //! Every tool that touches a guest resolves its domain through `libvirt`, opens
 //! a fresh `SpiceSession`, performs the operation and drops the connection —
@@ -6,7 +10,8 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use rmcp::model::ContentBlock;
+use rmcp::schemars;
 
 use crate::libvirt::{DomainInfo, Libvirt};
 use crate::spice::{Button, ScrollDir, SpiceSession};
@@ -15,294 +20,207 @@ const DEFAULT_SCREENSHOT_WAIT_MS: u32 = 500;
 const DEFAULT_TYPE_INTERVAL_MS: u64 = 20;
 const DEFAULT_SCROLL_CLICKS: u32 = 1;
 
-/// Result of a `tools/call`, ready to be embedded in the JSON-RPC result.
-pub struct ToolOutput {
-    pub content: Vec<Value>,
-    pub is_error: bool,
+/// Mouse buttons accepted by the `mouse_click` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
 }
 
-impl ToolOutput {
-    pub fn error(message: impl Into<String>) -> Self {
-        ToolOutput {
-            content: vec![text_content(message.into())],
-            is_error: true,
-        }
-    }
+/// Wheel directions accepted by the `mouse_scroll` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollDirection {
+    Up,
+    Down,
 }
 
-/// JSON-Schema definitions of all eight tools, in `tools/list` order.
-pub fn tool_definitions() -> Vec<Value> {
-    let domain = json!({
-        "type": "string",
-        "description": "Domain name as listed by list_domains, e.g. \"Windows10\".",
-    });
-    vec![
-        json!({
-            "name": "list_domains",
-            "description": "List all libvirt domains with their id, state and SPICE display endpoint.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        }),
-        json!({
-            "name": "screenshot",
-            "description": "Capture the SPICE display of a domain and return it as a PNG image.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "wait_ms": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Quiet period in milliseconds to wait for display updates before capturing (default 500).",
-                    },
-                },
-                "required": ["domain"],
-            },
-        }),
-        json!({
-            "name": "type_text",
-            "description": "Type ASCII text into a domain through the SPICE inputs channel.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "text": {
-                        "type": "string",
-                        "description": "ASCII text to type (US keyboard layout).",
-                    },
-                    "interval_ms": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Delay between keystrokes in milliseconds (default 20).",
-                    },
-                },
-                "required": ["domain", "text"],
-            },
-        }),
-        json!({
-            "name": "key_press",
-            "description": "Send a key combination such as \"ctrl+alt+t\" or a single key such as \"enter\" to a domain.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "keys": {
-                        "type": "string",
-                        "description": "Key names joined with '+', e.g. \"ctrl+alt+t\". Names are case-insensitive.",
-                    },
-                },
-                "required": ["domain", "keys"],
-            },
-        }),
-        json!({
-            "name": "mouse_move",
-            "description": "Move the mouse pointer to an absolute position inside a domain's display.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "x": { "type": "integer", "minimum": 0, "description": "X coordinate in guest pixels." },
-                    "y": { "type": "integer", "minimum": 0, "description": "Y coordinate in guest pixels." },
-                },
-                "required": ["domain", "x", "y"],
-            },
-        }),
-        json!({
-            "name": "mouse_click",
-            "description": "Click a mouse button in a domain, optionally moving to a position first.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "button": {
-                        "type": "string",
-                        "enum": ["left", "middle", "right"],
-                        "description": "Mouse button to click.",
-                    },
-                    "x": { "type": "integer", "minimum": 0, "description": "Optional X coordinate to move to before clicking." },
-                    "y": { "type": "integer", "minimum": 0, "description": "Optional Y coordinate to move to before clicking." },
-                    "double_click": {
-                        "type": "boolean",
-                        "description": "Click twice in quick succession (default false).",
-                    },
-                },
-                "required": ["domain", "button"],
-            },
-        }),
-        json!({
-            "name": "mouse_scroll",
-            "description": "Scroll the mouse wheel inside a domain's display.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "direction": {
-                        "type": "string",
-                        "enum": ["up", "down"],
-                        "description": "Scroll direction.",
-                    },
-                    "clicks": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Number of wheel clicks (default 1).",
-                    },
-                },
-                "required": ["domain", "direction"],
-            },
-        }),
-        json!({
-            "name": "mouse_drag",
-            "description": "Press the left mouse button at one position, drag to another position and release.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "domain": domain,
-                    "from_x": { "type": "integer", "minimum": 0, "description": "Start X coordinate." },
-                    "from_y": { "type": "integer", "minimum": 0, "description": "Start Y coordinate." },
-                    "to_x": { "type": "integer", "minimum": 0, "description": "End X coordinate." },
-                    "to_y": { "type": "integer", "minimum": 0, "description": "End Y coordinate." },
-                },
-                "required": ["domain", "from_x", "from_y", "to_x", "to_y"],
-            },
-        }),
-    ]
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScreenshotParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// Quiet period in milliseconds to wait for display updates before capturing (default 500).
+    pub wait_ms: Option<u32>,
 }
 
-/// Run a tool call. Tool failures are normal results carrying `isError`, not
-/// JSON-RPC errors.
-pub fn call_tool(libvirt: &Libvirt, name: &str, arguments: Option<&Value>) -> ToolOutput {
-    if name.is_empty() {
-        return ToolOutput::error("tools/call: 'name' must be a non-empty string");
-    }
-    let args = match arguments {
-        Some(value @ Value::Object(_)) => value.clone(),
-        _ => json!({}),
-    };
-    match run_tool(libvirt, name, &args) {
-        Ok(content) => ToolOutput {
-            content,
-            is_error: false,
-        },
-        Err(message) => ToolOutput::error(message),
-    }
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct TypeTextParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// ASCII text to type (US keyboard layout).
+    pub text: String,
+    /// Delay between keystrokes in milliseconds (default 20).
+    pub interval_ms: Option<u64>,
 }
 
-fn run_tool(libvirt: &Libvirt, name: &str, args: &Value) -> Result<Vec<Value>, String> {
-    match name {
-        "list_domains" => {
-            let domains = libvirt.list_domains()?;
-            Ok(vec![text_content(format_domain_table(&domains))])
-        }
-        "screenshot" => {
-            let domain = arg_string(args, "domain")?;
-            let wait_ms = arg_u32(args, "wait_ms", DEFAULT_SCREENSHOT_WAIT_MS)?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            let image = session.screenshot(wait_ms)?;
-            Ok(vec![
-                image_content(BASE64.encode(&image.png)),
-                text_content(format!(
-                    "screenshot of '{}': {}x{} PNG ({} bytes)",
-                    domain,
-                    image.width,
-                    image.height,
-                    image.png.len()
-                )),
-            ])
-        }
-        "type_text" => {
-            let domain = arg_string(args, "domain")?;
-            let text = arg_string(args, "text")?;
-            let interval_ms = arg_u64(args, "interval_ms", DEFAULT_TYPE_INTERVAL_MS)?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            session.type_text(&text, interval_ms)?;
-            Ok(vec![text_content(format!(
-                "typed {} character(s) into '{}'",
-                text.chars().count(),
-                domain
-            ))])
-        }
-        "key_press" => {
-            let domain = arg_string(args, "domain")?;
-            let keys = arg_string(args, "keys")?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            session.key_press(&keys)?;
-            Ok(vec![text_content(format!(
-                "sent key combination '{}' to '{}'",
-                keys, domain
-            ))])
-        }
-        "mouse_move" => {
-            let domain = arg_string(args, "domain")?;
-            let x = arg_required_u32(args, "x")?;
-            let y = arg_required_u32(args, "y")?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            session.mouse_move(x, y)?;
-            Ok(vec![text_content(format!(
-                "moved mouse to ({}, {}) on '{}'",
-                x, y, domain
-            ))])
-        }
-        "mouse_click" => {
-            let domain = arg_string(args, "domain")?;
-            let button = parse_button(&arg_string(args, "button")?)?;
-            let x = arg_optional_u32(args, "x")?;
-            let y = arg_optional_u32(args, "y")?;
-            if x.is_some() != y.is_some() {
-                return Err(
-                    "arguments 'x' and 'y' must be provided together for mouse_click".to_string(),
-                );
-            }
-            let double = arg_bool(args, "double_click", false)?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            session.mouse_click(button, x, y, double)?;
-            let action = if double { "double-clicked" } else { "clicked" };
-            let position = match (x, y) {
-                (Some(x), Some(y)) => format!(" at ({}, {})", x, y),
-                _ => String::new(),
-            };
-            Ok(vec![text_content(format!(
-                "{} {} button{} on '{}'",
-                action,
-                button_label(&button),
-                position,
-                domain
-            ))])
-        }
-        "mouse_scroll" => {
-            let domain = arg_string(args, "domain")?;
-            let direction = parse_scroll_direction(&arg_string(args, "direction")?)?;
-            let clicks = arg_u32(args, "clicks", DEFAULT_SCROLL_CLICKS)?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            session.mouse_scroll(direction, clicks)?;
-            Ok(vec![text_content(format!(
-                "scrolled {} {} click(s) on '{}'",
-                direction_label(&direction),
-                clicks,
-                domain
-            ))])
-        }
-        "mouse_drag" => {
-            let domain = arg_string(args, "domain")?;
-            let from_x = arg_required_u32(args, "from_x")?;
-            let from_y = arg_required_u32(args, "from_y")?;
-            let to_x = arg_required_u32(args, "to_x")?;
-            let to_y = arg_required_u32(args, "to_y")?;
-            let mut session = connect_spice(libvirt, &domain)?;
-            session.mouse_drag((from_x, from_y), (to_x, to_y))?;
-            Ok(vec![text_content(format!(
-                "dragged ({}, {}) -> ({}, {}) on '{}'",
-                from_x, from_y, to_x, to_y, domain
-            ))])
-        }
-        other => Err(format!(
-            "unknown tool '{}'; available tools: {}",
-            other,
-            tool_name_list()
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct KeyPressParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// Key names joined with '+', e.g. "ctrl+alt+t". Names are case-insensitive.
+    pub keys: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct MouseMoveParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// X coordinate in guest pixels.
+    pub x: u32,
+    /// Y coordinate in guest pixels.
+    pub y: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct MouseClickParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// Mouse button to click.
+    pub button: MouseButton,
+    /// Optional X coordinate to move to before clicking; must be given together with `y`.
+    pub x: Option<u32>,
+    /// Optional Y coordinate to move to before clicking; must be given together with `x`.
+    pub y: Option<u32>,
+    /// Click twice in quick succession (default false).
+    pub double_click: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct MouseScrollParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// Scroll direction.
+    pub direction: ScrollDirection,
+    /// Number of wheel clicks (default 1).
+    pub clicks: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct MouseDragParams {
+    /// Domain name as listed by list_domains, e.g. "Windows10".
+    pub domain: String,
+    /// X coordinate where the drag starts.
+    pub from_x: u32,
+    /// Y coordinate where the drag starts.
+    pub from_y: u32,
+    /// X coordinate where the drag ends.
+    pub to_x: u32,
+    /// Y coordinate where the drag ends.
+    pub to_y: u32,
+}
+
+/// `list_domains`: a table of every domain with id, state and SPICE endpoint.
+pub fn list_domains(libvirt: &Libvirt) -> Result<Vec<ContentBlock>, String> {
+    let domains = libvirt.list_domains()?;
+    Ok(vec![ContentBlock::text(format_domain_table(&domains))])
+}
+
+/// `screenshot`: one PNG image block plus a text block with the dimensions.
+pub fn screenshot(libvirt: &Libvirt, params: ScreenshotParams) -> Result<Vec<ContentBlock>, String> {
+    let wait_ms = params.wait_ms.unwrap_or(DEFAULT_SCREENSHOT_WAIT_MS);
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    let image = session.screenshot(wait_ms)?;
+    Ok(vec![
+        ContentBlock::image(BASE64.encode(&image.png), "image/png"),
+        ContentBlock::text(format!(
+            "screenshot of '{}': {}x{} PNG ({} bytes)",
+            params.domain,
+            image.width,
+            image.height,
+            image.png.len()
         )),
+    ])
+}
+
+/// `type_text`: type ASCII text through the SPICE inputs channel.
+pub fn type_text(libvirt: &Libvirt, params: TypeTextParams) -> Result<Vec<ContentBlock>, String> {
+    let interval_ms = params.interval_ms.unwrap_or(DEFAULT_TYPE_INTERVAL_MS);
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    session.type_text(&params.text, interval_ms)?;
+    Ok(vec![ContentBlock::text(format!(
+        "typed {} character(s) into '{}'",
+        params.text.chars().count(),
+        params.domain
+    ))])
+}
+
+/// `key_press`: send a key combination such as `ctrl+alt+t`.
+pub fn key_press(libvirt: &Libvirt, params: KeyPressParams) -> Result<Vec<ContentBlock>, String> {
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    session.key_press(&params.keys)?;
+    Ok(vec![ContentBlock::text(format!(
+        "sent key combination '{}' to '{}'",
+        params.keys, params.domain
+    ))])
+}
+
+/// `mouse_move`: move the pointer to an absolute position.
+pub fn mouse_move(libvirt: &Libvirt, params: MouseMoveParams) -> Result<Vec<ContentBlock>, String> {
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    session.mouse_move(params.x, params.y)?;
+    Ok(vec![ContentBlock::text(format!(
+        "moved mouse to ({}, {}) on '{}'",
+        params.x, params.y, params.domain
+    ))])
+}
+
+/// `mouse_click`: optionally move first, then press and release one button.
+pub fn mouse_click(
+    libvirt: &Libvirt,
+    params: MouseClickParams,
+) -> Result<Vec<ContentBlock>, String> {
+    if params.x.is_some() != params.y.is_some() {
+        return Err("arguments 'x' and 'y' must be provided together for mouse_click".to_string());
     }
+    let double = params.double_click.unwrap_or(false);
+    let position = match (params.x, params.y) {
+        (Some(x), Some(y)) => format!(" at ({}, {})", x, y),
+        _ => String::new(),
+    };
+
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    session.mouse_click(
+        mouse_button(params.button),
+        params.x,
+        params.y,
+        double,
+    )?;
+    let action = if double { "double-clicked" } else { "clicked" };
+    Ok(vec![ContentBlock::text(format!(
+        "{} {} button{} on '{}'",
+        action,
+        mouse_button_name(params.button),
+        position,
+        params.domain
+    ))])
+}
+
+/// `mouse_scroll`: press and release the wheel button a number of times.
+pub fn mouse_scroll(
+    libvirt: &Libvirt,
+    params: MouseScrollParams,
+) -> Result<Vec<ContentBlock>, String> {
+    let clicks = params.clicks.unwrap_or(DEFAULT_SCROLL_CLICKS);
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    session.mouse_scroll(scroll_direction(params.direction), clicks)?;
+    Ok(vec![ContentBlock::text(format!(
+        "scrolled {} {} click(s) on '{}'",
+        scroll_direction_name(params.direction),
+        clicks,
+        params.domain
+    ))])
+}
+
+/// `mouse_drag`: press the left button, drag to another position, release.
+pub fn mouse_drag(libvirt: &Libvirt, params: MouseDragParams) -> Result<Vec<ContentBlock>, String> {
+    let mut session = connect_spice(libvirt, &params.domain)?;
+    session.mouse_drag((params.from_x, params.from_y), (params.to_x, params.to_y))?;
+    Ok(vec![ContentBlock::text(format!(
+        "dragged ({}, {}) -> ({}, {}) on '{}'",
+        params.from_x, params.from_y, params.to_x, params.to_y, params.domain
+    ))])
 }
 
 /// Resolve a domain name to a SPICE endpoint and open a fresh session.
@@ -313,7 +231,7 @@ fn connect_spice(libvirt: &Libvirt, domain: &str) -> Result<SpiceSession, String
         None => {
             return Err(format!(
                 "domain '{}' has no SPICE display endpoint (state: {}); \
-                 start the domain and check that its XML has <graphics type='spice'>",
+                 start the domain and check that its XML has <graphics type='spice'> with a port",
                 domain, info.state
             ))
         }
@@ -323,6 +241,36 @@ fn connect_spice(libvirt: &Libvirt, domain: &str) -> Result<SpiceSession, String
         Err(_) => String::new(),
     };
     SpiceSession::connect(endpoint, &password)
+}
+
+fn mouse_button(button: MouseButton) -> Button {
+    match button {
+        MouseButton::Left => Button::Left,
+        MouseButton::Middle => Button::Middle,
+        MouseButton::Right => Button::Right,
+    }
+}
+
+fn mouse_button_name(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Middle => "middle",
+        MouseButton::Right => "right",
+    }
+}
+
+fn scroll_direction(direction: ScrollDirection) -> ScrollDir {
+    match direction {
+        ScrollDirection::Up => ScrollDir::Up,
+        ScrollDirection::Down => ScrollDir::Down,
+    }
+}
+
+fn scroll_direction_name(direction: ScrollDirection) -> &'static str {
+    match direction {
+        ScrollDirection::Up => "up",
+        ScrollDirection::Down => "down",
+    }
 }
 
 fn format_domain_table(domains: &[DomainInfo]) -> String {
@@ -388,248 +336,79 @@ fn format_table_row(row: &[String; 4], widths: &[usize; 4]) -> String {
     line
 }
 
-fn tool_name_list() -> String {
-    tool_definitions()
-        .iter()
-        .filter_map(|definition| definition["name"].as_str().map(|name| name.to_string()))
-        .collect::<Vec<String>>()
-        .join(", ")
-}
-
-fn parse_button(text: &str) -> Result<Button, String> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "left" => Ok(Button::Left),
-        "middle" => Ok(Button::Middle),
-        "right" => Ok(Button::Right),
-        other => Err(format!(
-            "argument 'button' must be one of \"left\", \"middle\", \"right\" (got \"{}\")",
-            other
-        )),
-    }
-}
-
-fn parse_scroll_direction(text: &str) -> Result<ScrollDir, String> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "up" => Ok(ScrollDir::Up),
-        "down" => Ok(ScrollDir::Down),
-        other => Err(format!(
-            "argument 'direction' must be \"up\" or \"down\" (got \"{}\")",
-            other
-        )),
-    }
-}
-
-fn button_label(button: &Button) -> String {
-    match button {
-        Button::Left => "left".to_string(),
-        Button::Middle => "middle".to_string(),
-        Button::Right => "right".to_string(),
-    }
-}
-
-fn direction_label(direction: &ScrollDir) -> String {
-    match direction {
-        ScrollDir::Up => "up".to_string(),
-        ScrollDir::Down => "down".to_string(),
-    }
-}
-
-fn text_content(text: String) -> Value {
-    json!({ "type": "text", "text": text })
-}
-
-fn image_content(base64_png: String) -> Value {
-    json!({ "type": "image", "data": base64_png, "mimeType": "image/png" })
-}
-
-fn arg_string(args: &Value, key: &str) -> Result<String, String> {
-    match args.get(key) {
-        Some(Value::String(value)) => Ok(value.clone()),
-        Some(_) => Err(format!("argument '{}' must be a string", key)),
-        None => Err(format!("missing required argument '{}'", key)),
-    }
-}
-
-fn arg_u32(args: &Value, key: &str, default: u32) -> Result<u32, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(value) => number_to_u32(value)
-            .ok_or_else(|| format!("argument '{}' must be a non-negative integer", key)),
-    }
-}
-
-fn arg_required_u32(args: &Value, key: &str) -> Result<u32, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Err(format!("missing required argument '{}'", key)),
-        Some(value) => number_to_u32(value)
-            .ok_or_else(|| format!("argument '{}' must be a non-negative integer", key)),
-    }
-}
-
-fn arg_optional_u32(args: &Value, key: &str) -> Result<Option<u32>, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => match number_to_u32(value) {
-            Some(number) => Ok(Some(number)),
-            None => Err(format!(
-                "argument '{}' must be a non-negative integer",
-                key
-            )),
-        },
-    }
-}
-
-fn arg_u64(args: &Value, key: &str, default: u64) -> Result<u64, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| format!("argument '{}' must be a non-negative integer", key)),
-    }
-}
-
-fn arg_bool(args: &Value, key: &str, default: bool) -> Result<bool, String> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("argument '{}' must be a boolean", key)),
-    }
-}
-
-fn number_to_u32(value: &Value) -> Option<u32> {
-    let number = value.as_u64()?;
-    u32::try_from(number).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libvirt::SpiceEndpoint;
 
-    fn test_libvirt() -> Libvirt {
-        Libvirt {
-            uri: "qemu:///system".to_string(),
+    fn text_of(content: &[ContentBlock]) -> String {
+        match content.first() {
+            Some(ContentBlock::Text(text)) => text.text.clone(),
+            _ => String::new(),
         }
     }
 
     #[test]
-    fn tool_definitions_cover_the_documented_tool_set() {
-        let definitions = tool_definitions();
-        let names: Vec<&str> = definitions
-            .iter()
-            .map(|definition| definition["name"].as_str().expect("tool name"))
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                "list_domains",
-                "screenshot",
-                "type_text",
-                "key_press",
-                "mouse_move",
-                "mouse_click",
-                "mouse_scroll",
-                "mouse_drag"
-            ]
-        );
-        for definition in &definitions {
-            let description = definition["description"].as_str().expect("description");
-            assert!(!description.is_empty());
-            assert_eq!(definition["inputSchema"]["type"], "object");
-            assert!(definition["inputSchema"]["properties"].is_object());
-            assert!(definition["inputSchema"]["required"].is_array());
-        }
-        assert_eq!(
-            tool_definitions()[1]["inputSchema"]["required"],
-            json!(["domain"])
-        );
-        assert_eq!(
-            tool_definitions()[5]["inputSchema"]["properties"]["button"]["enum"],
-            json!(["left", "middle", "right"])
-        );
+    fn params_deserialize_with_documented_defaults() {
+        let params: ScreenshotParams =
+            serde_json::from_value(serde_json::json!({"domain": "Windows10"})).expect("deserialize");
+        assert_eq!(params.domain, "Windows10");
+        assert_eq!(params.wait_ms, None);
+
+        let params: MouseClickParams = serde_json::from_value(
+            serde_json::json!({"domain": "Windows10", "button": "right", "double_click": true}),
+        )
+        .expect("deserialize");
+        assert_eq!(params.button, MouseButton::Right);
+        assert_eq!(params.double_click, Some(true));
+        assert_eq!(params.x, None);
     }
 
     #[test]
-    fn unknown_tool_reports_an_error_with_the_tool_list() {
-        let output = call_tool(&test_libvirt(), "teleport", None);
-        assert!(output.is_error);
-        let text = output.content[0]["text"].as_str().expect("error text");
-        assert!(text.contains("unknown tool 'teleport'"), "got: {}", text);
-        assert!(text.contains("list_domains"), "got: {}", text);
-    }
-
-    #[test]
-    fn empty_tool_name_is_reported() {
-        let output = call_tool(&test_libvirt(), "", Some(&json!({})));
-        assert!(output.is_error);
-        let text = output.content[0]["text"].as_str().expect("error text");
-        assert!(text.contains("'name'"), "got: {}", text);
-    }
-
-    #[test]
-    fn domain_tools_require_the_domain_argument() {
-        let libvirt = test_libvirt();
-        for name in [
-            "screenshot",
-            "type_text",
-            "key_press",
-            "mouse_move",
-            "mouse_click",
-            "mouse_scroll",
-            "mouse_drag",
-        ] {
-            let output = call_tool(&libvirt, name, Some(&json!({})));
-            assert!(output.is_error, "{} must fail without a domain", name);
-            let text = output.content[0]["text"].as_str().expect("error text");
-            assert!(text.contains("'domain'"), "{}: got {}", name, text);
-        }
-    }
-
-    #[test]
-    fn mouse_click_rejects_unknown_button() {
-        let output = call_tool(
-            &test_libvirt(),
-            "mouse_click",
-            Some(&json!({"domain": "x", "button": "thumb"})),
+    fn enums_reject_unknown_values() {
+        let result = serde_json::from_value::<MouseClickParams>(
+            serde_json::json!({"domain": "Windows10", "button": "thumb"}),
         );
-        assert!(output.is_error);
-        let text = output.content[0]["text"].as_str().expect("error text");
-        assert!(text.contains("'button'"), "got: {}", text);
+        assert!(result.is_err());
+        let result = serde_json::from_value::<MouseScrollParams>(
+            serde_json::json!({"domain": "Windows10", "direction": "sideways"}),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
     fn mouse_click_requires_both_coordinates() {
-        let output = call_tool(
-            &test_libvirt(),
-            "mouse_click",
-            Some(&json!({"domain": "x", "button": "left", "x": 3})),
-        );
-        assert!(output.is_error);
-        let text = output.content[0]["text"].as_str().expect("error text");
-        assert!(text.contains("'x' and 'y'"), "got: {}", text);
+        let libvirt = test_libvirt();
+        let error = mouse_click(
+            &libvirt,
+            MouseClickParams {
+                domain: "Windows10".to_string(),
+                button: MouseButton::Left,
+                x: Some(3),
+                y: None,
+                double_click: None,
+            },
+        )
+        .expect_err("x without y must be rejected");
+        assert!(error.contains("'x' and 'y'"), "got: {}", error);
     }
 
     #[test]
-    fn mouse_scroll_rejects_unknown_direction() {
-        let output = call_tool(
-            &test_libvirt(),
-            "mouse_scroll",
-            Some(&json!({"domain": "x", "direction": "sideways"})),
-        );
-        assert!(output.is_error);
-        let text = output.content[0]["text"].as_str().expect("error text");
-        assert!(text.contains("'direction'"), "got: {}", text);
-    }
-
-    #[test]
-    fn integer_arguments_reject_wrong_types() {
-        let output = call_tool(
-            &test_libvirt(),
-            "mouse_move",
-            Some(&json!({"domain": "x", "x": "3", "y": 4})),
-        );
-        assert!(output.is_error);
-        let text = output.content[0]["text"].as_str().expect("error text");
-        assert!(text.contains("'x'"), "got: {}", text);
+    fn unknown_domain_is_reported_by_the_libvirt_layer() {
+        // The libvirt test driver needs no daemon, so the failure is always the
+        // missing domain rather than an unreachable hypervisor.
+        let libvirt = Libvirt {
+            uri: "test:///default".to_string(),
+        };
+        let error = screenshot(
+            &libvirt,
+            ScreenshotParams {
+                domain: "nope".to_string(),
+                wait_ms: None,
+            },
+        )
+        .expect_err("a missing domain must be an error");
+        assert!(error.contains("nope"), "got: {}", error);
     }
 
     #[test]
@@ -645,7 +424,7 @@ mod tests {
                 name: "Debian".to_string(),
                 id: Some(3),
                 state: "running".to_string(),
-                spice: Some(crate::libvirt::SpiceEndpoint::Tcp {
+                spice: Some(SpiceEndpoint::Tcp {
                     host: "127.0.0.1".to_string(),
                     port: 5900,
                 }),
@@ -669,10 +448,25 @@ mod tests {
     }
 
     #[test]
-    fn image_content_uses_base64_png_shape() {
-        let content = image_content("aGVsbG8=".to_string());
-        assert_eq!(content["type"], "image");
-        assert_eq!(content["mimeType"], "image/png");
-        assert_eq!(content["data"], "aGVsbG8=");
+    fn screenshot_content_is_an_image_block_plus_dimensions() {
+        // The image block is built from `PngImage`; this pins the block shape.
+        let content = vec![
+            ContentBlock::image("aGVsbG8=".to_string(), "image/png"),
+            ContentBlock::text("screenshot of 'x': 1x1 PNG (3 bytes)".to_string()),
+        ];
+        match &content[0] {
+            ContentBlock::Image(image) => {
+                assert_eq!(image.data, "aGVsbG8=");
+                assert_eq!(image.mime_type, "image/png");
+            }
+            other => panic!("expected an image block, got {:?}", other),
+        }
+        assert!(text_of(&content[1..]).contains("1x1"));
+    }
+
+    fn test_libvirt() -> Libvirt {
+        Libvirt {
+            uri: "qemu:///system".to_string(),
+        }
     }
 }

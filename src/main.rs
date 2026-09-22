@@ -1,27 +1,33 @@
 //! mcp-libvirt: an MCP server that drives libvirt domains over SPICE.
 //!
 //! `main.rs` is the crate root (there is no `lib.rs`). It builds the libvirt
-//! handle, wires up the tool registry and serves the JSON-RPC loop on stdio.
+//! handle and serves the MCP protocol on stdio; stdout belongs to the `rmcp`
+//! transport, diagnostics go to stderr.
 
 mod libvirt;
 mod mcp;
 mod spice;
 mod tools;
 
-use libvirt::Libvirt;
-use mcp::McpServer;
+use std::sync::Arc;
 
-fn main() {
-    let libvirt = Libvirt::new();
+use rmcp::{transport::stdio, ServiceExt};
+
+use crate::libvirt::Libvirt;
+use crate::mcp::LibvirtTools;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let libvirt = Arc::new(Libvirt::new());
+    let tools = LibvirtTools::new(Arc::clone(&libvirt));
     eprintln!(
-        "mcp-libvirt {}: libvirt URI '{}'",
+        "{} {}: libvirt URI '{}'",
+        mcp::SERVER_NAME,
         mcp::SERVER_VERSION,
         libvirt.uri
     );
 
-    let server = McpServer::new(libvirt);
-    if let Err(message) = server.run() {
-        eprintln!("mcp-libvirt: fatal: {}", message);
-        std::process::exit(1);
-    }
+    let service = tools.serve(stdio()).await?;
+    service.waiting().await?;
+    Ok(())
 }

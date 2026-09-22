@@ -1,11 +1,13 @@
-//! libvirt access through the `virsh` CLI.
+//! libvirt access through the official `virt` crate (FFI bindings to libvirt).
 //!
-//! There are no libvirt development headers on the target host, so every lookup
-//! shells out to `virsh --connect <uri> ...` and parses the human-readable
-//! output. Only `list_domains`, `domain` and the pure parsing helpers below are
-//! part of the public contract used by `tools.rs`.
+//! The public contract (`Libvirt`, `DomainInfo`, `SpiceEndpoint`) is unchanged
+//! from the earlier virsh-based implementation; only the transport changed.
+//! A connection is opened for each call and dropped afterwards, which keeps
+//! `Libvirt` a plain shareable handle holding just the connection URI.
 
-use std::process::Command;
+use virt::connect::Connect;
+use virt::domain::Domain;
+use virt::sys;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainInfo {
@@ -47,199 +49,88 @@ impl Libvirt {
     }
 
     pub fn list_domains(&self) -> Result<Vec<DomainInfo>, String> {
-        let output = self.run(&["list", "--all", "--name"])?;
-        let mut domains = Vec::new();
-        for line in output.lines() {
-            let name = line.trim();
-            if name.is_empty() {
-                continue;
-            }
-            domains.push(self.domain_info(name));
+        let connection = self.open()?;
+        let domains = connection
+            .list_all_domains(0)
+            .map_err(|e| format!("cannot list domains on '{}': {}", self.uri, e))?;
+        let mut infos = Vec::with_capacity(domains.len());
+        for domain in &domains {
+            let (name, state) = domain_name_and_state(domain)?;
+            // A listing must not fail because one domain's XML cannot be read
+            // (the domain may have gone away between the two calls).
+            let spice = match spice_endpoint(domain, &name) {
+                Ok(endpoint) => endpoint,
+                Err(_) => None,
+            };
+            infos.push(DomainInfo {
+                name,
+                id: domain.get_id(),
+                state,
+                spice,
+            });
         }
-        Ok(domains)
+        Ok(infos)
     }
 
     pub fn domain(&self, name: &str) -> Result<DomainInfo, String> {
-        let state = self
-            .run(&["domstate", name])
+        let connection = self.open()?;
+        let domain = Domain::lookup_by_name(&connection, name)
             .map_err(|e| format!("domain '{}' is not available: {}", name, e))?;
+        let (name, state) = domain_name_and_state(&domain)?;
+        // The tools need the endpoint, so XML problems are reported here rather
+        // than being mistaken for "this domain has no SPICE display".
+        let spice = spice_endpoint(&domain, &name)?;
         Ok(DomainInfo {
-            name: name.to_string(),
-            id: self.domain_id(name),
-            state: state.trim().to_string(),
-            spice: self.spice_endpoint(name),
+            name,
+            id: domain.get_id(),
+            state,
+            spice,
         })
     }
 
-    /// Best-effort info for a name that came out of `virsh list`, so that a
-    /// single domain disappearing mid-listing cannot fail the whole table.
-    fn domain_info(&self, name: &str) -> DomainInfo {
-        let state = match self.run(&["domstate", name]) {
-            Ok(output) => output.trim().to_string(),
-            Err(_) => "unknown".to_string(),
-        };
-        DomainInfo {
-            name: name.to_string(),
-            id: self.domain_id(name),
-            state,
-            spice: self.spice_endpoint(name),
-        }
-    }
-
-    fn domain_id(&self, name: &str) -> Option<u32> {
-        match self.run(&["domid", name]) {
-            Ok(output) => parse_domid(&output),
-            Err(_) => None,
-        }
-    }
-
-    /// SPICE endpoint of a domain: `virsh domdisplay` first (authoritative for
-    /// running domains, returns the autoport that was actually assigned), then
-    /// the `<graphics type='spice'>` element of `virsh dumpxml` as a fallback
-    /// for domains where the display port is fixed in the XML.
-    fn spice_endpoint(&self, name: &str) -> Option<SpiceEndpoint> {
-        if let Ok(output) = self.run(&["domdisplay", name]) {
-            if let Some(endpoint) = parse_domdisplay(&output) {
-                return Some(endpoint);
-            }
-        }
-        // Without --type, domdisplay reports the first display, which may be a
-        // VNC display on domains that expose both.
-        if let Ok(output) = self.run(&["domdisplay", "--type", "spice", name]) {
-            if let Some(endpoint) = parse_domdisplay(&output) {
-                return Some(endpoint);
-            }
-        }
-        match self.run(&["dumpxml", name]) {
-            Ok(xml) => parse_spice_from_xml(&xml),
-            Err(_) => None,
-        }
-    }
-
-    fn run(&self, args: &[&str]) -> Result<String, String> {
-        let output = Command::new("virsh")
-            .arg("--connect")
-            .arg(&self.uri)
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to run virsh: {} (is libvirt installed?)", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stderr = stderr.trim();
-            if stderr.is_empty() {
-                return Err(format!("virsh {} failed with {}", args.join(" "), output.status));
-            }
-            return Err(stderr.to_string());
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    fn open(&self) -> Result<Connect, String> {
+        Connect::open(Some(&self.uri))
+            .map_err(|e| format!("cannot connect to libvirt at '{}': {}", self.uri, e))
     }
 }
 
-/// `virsh domid` prints the numeric id, or `-` for a domain that is not running.
-fn parse_domid(output: &str) -> Option<u32> {
-    output.trim().parse::<u32>().ok()
+fn domain_name_and_state(domain: &Domain) -> Result<(String, String), String> {
+    let name = domain
+        .get_name()
+        .map_err(|e| format!("cannot read the name of domain id {:?}: {}", domain.get_id(), e))?;
+    let (state, _reason) = domain
+        .get_state()
+        .map_err(|e| format!("cannot read the state of domain '{}': {}", name, e))?;
+    Ok((name, state_name(state)))
 }
 
-/// Parse `virsh domdisplay` output. Accepted forms (whitespace trimmed):
-/// `spice://HOST:PORT`, `spice+unix:///path/to/socket`, `spice://?socket=/path`.
-/// Anything else (including `vnc://...` and error text) yields `None`.
-fn parse_domdisplay(output: &str) -> Option<SpiceEndpoint> {
-    let text = output.trim();
-    if let Some(rest) = strip_prefix_ci(text, "spice+unix://") {
-        return parse_spice_uri_rest(rest);
-    }
-    if let Some(rest) = strip_prefix_ci(text, "spice://") {
-        return parse_spice_uri_rest(rest);
-    }
-    None
+/// SPICE endpoint of a domain, taken from its live XML (flags 0). For a running
+/// domain with `autoport='yes'` the live XML carries the port that was actually
+/// assigned.
+fn spice_endpoint(domain: &Domain, name: &str) -> Result<Option<SpiceEndpoint>, String> {
+    let xml = domain
+        .get_xml_desc(0)
+        .map_err(|e| format!("cannot read the XML of domain '{}': {}", name, e))?;
+    Ok(parse_spice_from_xml(&xml))
 }
 
-fn parse_spice_uri_rest(rest: &str) -> Option<SpiceEndpoint> {
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    if let Some(query) = rest.strip_prefix('?') {
-        let mut host: Option<String> = None;
-        let mut port: Option<u16> = None;
-        let mut socket: Option<String> = None;
-        for pair in query.split('&') {
-            let (key, value) = match pair.split_once('=') {
-                Some(key_value) => key_value,
-                None => continue,
-            };
-            let value = percent_decode(value);
-            match key.trim().to_ascii_lowercase().as_str() {
-                "socket" => socket = Some(value),
-                "host" => host = Some(value),
-                "port" => port = value.trim().parse::<u16>().ok(),
-                _ => {}
-            }
-        }
-        if let Some(path) = socket {
-            return Some(SpiceEndpoint::Unix { path });
-        }
-        if let Some(port) = port {
-            return Some(SpiceEndpoint::Tcp {
-                host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
-                port,
-            });
-        }
-        return None;
-    }
-    if rest.starts_with('/') {
-        return Some(SpiceEndpoint::Unix {
-            path: rest.to_string(),
-        });
-    }
-    match rest.rsplit_once(':') {
-        Some((host, port_text)) if !host.is_empty() => port_text
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .map(|port| SpiceEndpoint::Tcp {
-                host: host.to_string(),
-                port,
-            }),
-        _ => None,
+/// libvirt's numeric `virDomainState` as the human-readable strings used in
+/// tool output.
+fn state_name(state: sys::virDomainState) -> String {
+    match state {
+        sys::VIR_DOMAIN_NOSTATE => "no state".to_string(),
+        sys::VIR_DOMAIN_RUNNING => "running".to_string(),
+        sys::VIR_DOMAIN_BLOCKED => "blocked".to_string(),
+        sys::VIR_DOMAIN_PAUSED => "paused".to_string(),
+        sys::VIR_DOMAIN_SHUTDOWN => "shutdown".to_string(),
+        sys::VIR_DOMAIN_SHUTOFF => "shut off".to_string(),
+        sys::VIR_DOMAIN_CRASHED => "crashed".to_string(),
+        sys::VIR_DOMAIN_PMSUSPENDED => "pmsuspended".to_string(),
+        other => format!("unknown (state {})", other),
     }
 }
 
-fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    match text.get(..prefix.len()) {
-        Some(head) if head.eq_ignore_ascii_case(prefix) => Some(&text[prefix.len()..]),
-        _ => None,
-    }
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push(high * 16 + low);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Parse the SPICE endpoint out of `virsh dumpxml` output.
+/// Parse the SPICE endpoint out of a domain's XML description.
 ///
 /// Returns `None` when there is no `<graphics type='spice'>` element, and also
 /// when the element exists but the port is unknown (for example
@@ -270,7 +161,10 @@ fn parse_spice_from_xml(xml: &str) -> Option<SpiceEndpoint> {
     }
 }
 
-fn spice_endpoint_from_element(graphics_attrs: &[(String, String)], body: &str) -> Option<SpiceEndpoint> {
+fn spice_endpoint_from_element(
+    graphics_attrs: &[(String, String)],
+    body: &str,
+) -> Option<SpiceEndpoint> {
     let mut listen_host: Option<String> = None;
     let mut socket_path: Option<String> = None;
 
@@ -424,18 +318,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn domid_parsing() {
-        assert_eq!(parse_domid("-\n"), None);
-        assert_eq!(parse_domid(""), None);
-        assert_eq!(parse_domid("not a number\n"), None);
-        assert_eq!(parse_domid("7\n"), Some(7));
-        assert_eq!(parse_domid("  42  "), Some(42));
+    fn state_names_match_libvirt_states() {
+        assert_eq!(state_name(sys::VIR_DOMAIN_NOSTATE), "no state");
+        assert_eq!(state_name(sys::VIR_DOMAIN_RUNNING), "running");
+        assert_eq!(state_name(sys::VIR_DOMAIN_BLOCKED), "blocked");
+        assert_eq!(state_name(sys::VIR_DOMAIN_PAUSED), "paused");
+        assert_eq!(state_name(sys::VIR_DOMAIN_SHUTDOWN), "shutdown");
+        assert_eq!(state_name(sys::VIR_DOMAIN_SHUTOFF), "shut off");
+        assert_eq!(state_name(sys::VIR_DOMAIN_CRASHED), "crashed");
+        assert_eq!(state_name(sys::VIR_DOMAIN_PMSUSPENDED), "pmsuspended");
+        assert_eq!(state_name(42), "unknown (state 42)");
     }
 
     #[test]
-    fn domdisplay_tcp() {
+    fn xml_of_a_stopped_autoport_domain_has_no_known_port() {
+        // Live XML of a stopped domain with autoport: no port attribute yet.
+        let xml = "    <graphics type='spice' autoport='yes'>\n      <listen type='address'/>\n      <image compression='off'/>\n    </graphics>\n";
+        assert_eq!(parse_spice_from_xml(xml), None);
+    }
+
+    #[test]
+    fn xml_of_a_running_autoport_domain_reports_the_assigned_port() {
+        // Live XML of a running domain: libvirt fills in the assigned port.
+        let xml = "    <graphics type='spice' port='5900' autoport='yes'>\n      <listen type='address' address='127.0.0.1'/>\n    </graphics>\n";
         assert_eq!(
-            parse_domdisplay("spice://127.0.0.1:5900\n"),
+            parse_spice_from_xml(xml),
             Some(SpiceEndpoint::Tcp {
                 host: "127.0.0.1".to_string(),
                 port: 5900
@@ -444,49 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn domdisplay_unix_socket() {
-        assert_eq!(
-            parse_domdisplay("spice+unix:///run/libvirt/qemu/spice.sock\n"),
-            Some(SpiceEndpoint::Unix {
-                path: "/run/libvirt/qemu/spice.sock".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn domdisplay_query_form() {
-        assert_eq!(
-            parse_domdisplay("spice://?socket=%2Ftmp%2Fspice.sock"),
-            Some(SpiceEndpoint::Unix {
-                path: "/tmp/spice.sock".to_string()
-            })
-        );
-        assert_eq!(
-            parse_domdisplay("spice://?host=10.0.0.5&port=5910"),
-            Some(SpiceEndpoint::Tcp {
-                host: "10.0.0.5".to_string(),
-                port: 5910
-            })
-        );
-    }
-
-    #[test]
-    fn domdisplay_rejects_other_display_types() {
-        assert_eq!(parse_domdisplay("vnc://127.0.0.1:5900\n"), None);
-        assert_eq!(parse_domdisplay("error: Domain is not running\n"), None);
-        assert_eq!(parse_domdisplay("spice://127.0.0.1\n"), None);
-        assert_eq!(parse_domdisplay(""), None);
-    }
-
-    #[test]
-    fn dumpxml_autoport_without_port_is_unknown() {
-        // Real output of `virsh dumpxml Windows10` on this host.
-        let xml = "    <graphics type='spice' autoport='yes'>\n      <listen type='address'/>\n      <image compression='off'/>\n    </graphics>\n";
-        assert_eq!(parse_spice_from_xml(xml), None);
-    }
-
-    #[test]
-    fn dumpxml_fixed_port_with_address_listen() {
+    fn xml_fixed_port_with_address_listen() {
         let xml = "    <graphics type='spice' port='5900' autoport='no'>\n      <listen type='address' address='127.0.0.1'/>\n    </graphics>\n";
         assert_eq!(
             parse_spice_from_xml(xml),
@@ -498,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn dumpxml_socket_listen_wins() {
+    fn xml_socket_listen_wins() {
         let xml = "    <graphics type='spice' autoport='no' port='5900'>\n      <listen type='socket' path='/run/libvirt/qemu/spice.sock'/>\n    </graphics>\n";
         assert_eq!(
             parse_spice_from_xml(xml),
@@ -509,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn dumpxml_double_quotes_and_legacy_listen_attribute() {
+    fn xml_double_quotes_and_legacy_listen_attribute() {
         let xml = "  <devices>\n    <graphics type=\"spice\" listen=\"10.0.0.5\" port=\"5910\" autoport=\"no\"/>\n  </devices>\n";
         assert_eq!(
             parse_spice_from_xml(xml),
@@ -521,13 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn dumpxml_non_spice_graphics_is_none() {
+    fn xml_non_spice_graphics_is_none() {
         let xml = "    <graphics type='vnc' port='5901' autoport='no' listen='127.0.0.1'/>\n";
         assert_eq!(parse_spice_from_xml(xml), None);
     }
 
     #[test]
-    fn dumpxml_picks_spice_among_several_graphics() {
+    fn xml_picks_spice_among_several_graphics() {
         let xml = "    <graphics type='vnc' port='5901' autoport='no'/>\n    <graphics type='spice' port='6000' autoport='no' listen='127.0.0.1'/>\n";
         assert_eq!(
             parse_spice_from_xml(xml),
@@ -536,6 +401,12 @@ mod tests {
                 port: 6000
             })
         );
+    }
+
+    #[test]
+    fn xml_port_zero_is_unknown() {
+        let xml = "    <graphics type='spice' port='0' autoport='yes'/>\n";
+        assert_eq!(parse_spice_from_xml(xml), None);
     }
 
     #[test]

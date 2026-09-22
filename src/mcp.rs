@@ -1,278 +1,293 @@
-//! Minimal MCP server: JSON-RPC 2.0 over stdio.
+//! `rmcp` glue: the tool router, the async tool handlers and the server handler.
 //!
-//! Framing is newline-delimited JSON — exactly one JSON-RPC message per line,
-//! which is what MCP stdio uses (the older `Content-Length` framing is not
-//! used). stdout carries JSON-RPC responses only; anything diagnostic must go
-//! to stderr.
+//! Tool parameter structs and the synchronous implementation of every tool live
+//! in [`crate::tools`]; this module only adapts them to the MCP layer. The
+//! server name and version are literals in the `#[tool]`/`#[tool_handler]`
+//! attributes below (the macros require literals); the constants here are used
+//! for the startup diagnostics on stderr.
 
-use std::io::{BufRead, Write};
+use std::sync::Arc;
 
-use serde_json::{json, Value};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 use crate::libvirt::Libvirt;
-use crate::tools;
+use crate::tools::{
+    self, KeyPressParams, MouseClickParams, MouseDragParams, MouseMoveParams, MouseScrollParams,
+    ScreenshotParams, TypeTextParams,
+};
 
-/// Protocol version reported when the client does not ask for a specific one.
-pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const SERVER_NAME: &str = "mcp-libvirt";
 pub const SERVER_VERSION: &str = "0.1.0";
 
-pub const PARSE_ERROR: i64 = -32700;
-pub const INVALID_REQUEST: i64 = -32600;
-pub const METHOD_NOT_FOUND: i64 = -32601;
-
-pub struct McpServer {
-    libvirt: Libvirt,
+#[derive(Clone)]
+pub struct LibvirtTools {
+    tool_router: ToolRouter<LibvirtTools>,
+    libvirt: Arc<Libvirt>,
 }
 
-impl McpServer {
-    pub fn new(libvirt: Libvirt) -> Self {
-        McpServer { libvirt }
-    }
-
-    /// Read one JSON-RPC message per stdin line until EOF, writing responses
-    /// (and nothing else) to stdout.
-    pub fn run(&self) -> Result<(), String> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|e| format!("failed to read stdin: {}", e))?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(response) = self.handle_line(line) {
-                let mut encoded = serde_json::to_vec(&response)
-                    .map_err(|e| format!("failed to encode JSON-RPC response: {}", e))?;
-                encoded.push(b'\n');
-                out.write_all(&encoded)
-                    .map_err(|e| format!("failed to write JSON-RPC response to stdout: {}", e))?;
-                out.flush()
-                    .map_err(|e| format!("failed to flush stdout: {}", e))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Handle one line of input. Returns `Some(response)` when a reply is due,
-    /// `None` for notifications and blank input.
-    pub fn handle_line(&self, line: &str) -> Option<Value> {
-        let message: Value = match serde_json::from_str(line) {
-            Ok(message) => message,
-            Err(e) => {
-                return Some(error_response(
-                    Value::Null,
-                    PARSE_ERROR,
-                    &format!("parse error: {}", e),
-                ))
-            }
-        };
-        self.handle_message(message)
-    }
-
-    pub fn handle_message(&self, message: Value) -> Option<Value> {
-        let object = match message {
-            Value::Object(object) => object,
-            _ => {
-                return Some(error_response(
-                    Value::Null,
-                    INVALID_REQUEST,
-                    "invalid request: expected a JSON object",
-                ))
-            }
-        };
-
-        let id = object.get("id").filter(|value| !value.is_null()).cloned();
-        let method = match object.get("method").and_then(|value| value.as_str()) {
-            Some(method) => method.to_string(),
-            None => {
-                return id.map(|id| {
-                    error_response(id, INVALID_REQUEST, "invalid request: missing 'method' string")
-                })
-            }
-        };
-        let params = object.get("params").cloned().unwrap_or(Value::Null);
-
-        match self.dispatch(&method, &params) {
-            Some(Ok(result)) => id.map(|id| success_response(id, result)),
-            Some(Err((code, message))) => id.map(|id| error_response(id, code, &message)),
-            // Notifications are never answered.
-            None => None,
+#[tool_router]
+impl LibvirtTools {
+    pub fn new(libvirt: Arc<Libvirt>) -> Self {
+        LibvirtTools {
+            tool_router: LibvirtTools::tool_router(),
+            libvirt,
         }
     }
 
-    fn dispatch(&self, method: &str, params: &Value) -> Option<Result<Value, (i64, String)>> {
-        match method {
-            "initialize" => Some(Ok(self.initialize_result(params))),
-            "ping" => Some(Ok(json!({}))),
-            "tools/list" => Some(Ok(json!({ "tools": tools::tool_definitions() }))),
-            "tools/call" => Some(Ok(self.tools_call_result(params))),
-            // e.g. notifications/initialized, notifications/cancelled.
-            _ if method.starts_with("notifications/") => None,
-            _ => Some(Err((
-                METHOD_NOT_FOUND,
-                format!("method not found: {}", method),
-            ))),
-        }
+    #[tool(description = "List all libvirt domains with their id, state and SPICE display endpoint.")]
+    async fn list_domains(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::list_domains(&libvirt)).await)
     }
 
-    fn initialize_result(&self, params: &Value) -> Value {
-        let requested = params
-            .get("protocolVersion")
-            .and_then(|value| value.as_str())
-            .filter(|version| !version.is_empty())
-            .unwrap_or(DEFAULT_PROTOCOL_VERSION);
-        json!({
-            "protocolVersion": requested,
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-        })
+    #[tool(description = "Capture the SPICE display of a domain and return it as a PNG image.")]
+    async fn screenshot(
+        &self,
+        Parameters(params): Parameters<ScreenshotParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::screenshot(&libvirt, params)).await)
     }
 
-    fn tools_call_result(&self, params: &Value) -> Value {
-        let name = params
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let arguments = params.get("arguments");
-        let output = tools::call_tool(&self.libvirt, name, arguments);
-        let mut result = json!({ "content": output.content });
-        if output.is_error {
-            result["isError"] = json!(true);
-        }
-        result
+    #[tool(description = "Type ASCII text into a domain through the SPICE inputs channel.")]
+    async fn type_text(
+        &self,
+        Parameters(params): Parameters<TypeTextParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::type_text(&libvirt, params)).await)
+    }
+
+    #[tool(
+        description = "Send a key combination such as \"ctrl+alt+t\" or a single key such as \"enter\" to a domain."
+    )]
+    async fn key_press(
+        &self,
+        Parameters(params): Parameters<KeyPressParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::key_press(&libvirt, params)).await)
+    }
+
+    #[tool(description = "Move the mouse pointer to an absolute position inside a domain's display.")]
+    async fn mouse_move(
+        &self,
+        Parameters(params): Parameters<MouseMoveParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::mouse_move(&libvirt, params)).await)
+    }
+
+    #[tool(description = "Click a mouse button in a domain, optionally moving to a position first.")]
+    async fn mouse_click(
+        &self,
+        Parameters(params): Parameters<MouseClickParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::mouse_click(&libvirt, params)).await)
+    }
+
+    #[tool(description = "Scroll the mouse wheel inside a domain's display.")]
+    async fn mouse_scroll(
+        &self,
+        Parameters(params): Parameters<MouseScrollParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::mouse_scroll(&libvirt, params)).await)
+    }
+
+    #[tool(
+        description = "Press the left mouse button at one position, drag to another position and release."
+    )]
+    async fn mouse_drag(
+        &self,
+        Parameters(params): Parameters<MouseDragParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let libvirt = Arc::clone(&self.libvirt);
+        Ok(blocking(move || tools::mouse_drag(&libvirt, params)).await)
     }
 }
 
-fn success_response(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
-}
+#[tool_handler(router = self.tool_router, name = "mcp-libvirt", version = "0.1.0")]
+impl ServerHandler for LibvirtTools {}
 
-fn error_response(id: Value, code: i64, message: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": code, "message": message },
-    })
+/// Run a synchronous tool implementation off the async runtime. Tool failures
+/// are reported as `isError` content so the caller sees the message.
+async fn blocking<F>(operation: F) -> CallToolResult
+where
+    F: FnOnce() -> Result<Vec<ContentBlock>, String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(Ok(content)) => CallToolResult::success(content),
+        Ok(Err(message)) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        Err(join_error) => CallToolResult::error(vec![ContentBlock::text(format!(
+            "internal error while running the tool: {}",
+            join_error
+        ))]),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{MouseButton, ScrollDirection};
 
-    fn server() -> McpServer {
-        McpServer::new(Libvirt {
+    fn server() -> LibvirtTools {
+        LibvirtTools::new(Arc::new(Libvirt {
             uri: "qemu:///system".to_string(),
-        })
+        }))
+    }
+
+    fn tool_result_text(result: &CallToolResult) -> String {
+        match result.content.first() {
+            Some(ContentBlock::Text(text)) => text.text.clone(),
+            _ => String::new(),
+        }
     }
 
     #[test]
-    fn initialize_echoes_client_protocol_version() {
-        let line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}}"#;
-        let response = server().handle_line(line).expect("initialize needs a reply");
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["id"], 1);
-        assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
-        assert_eq!(response["result"]["serverInfo"]["name"], "mcp-libvirt");
-        assert_eq!(response["result"]["serverInfo"]["version"], "0.1.0");
-        assert!(response["result"]["capabilities"]["tools"].is_object());
-    }
-
-    #[test]
-    fn initialize_without_version_uses_default() {
-        let line = r#"{"jsonrpc":"2.0","id":"abc","method":"initialize","params":{}}"#;
-        let response = server().handle_line(line).expect("initialize needs a reply");
-        assert_eq!(response["id"], "abc");
+    fn tool_router_exposes_the_eight_tools() {
+        let tools = LibvirtTools::tool_router().list_all();
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        // `list_all` returns the tools sorted by name.
         assert_eq!(
-            response["result"]["protocolVersion"],
-            DEFAULT_PROTOCOL_VERSION
+            names,
+            vec![
+                "key_press",
+                "list_domains",
+                "mouse_click",
+                "mouse_drag",
+                "mouse_move",
+                "mouse_scroll",
+                "screenshot",
+                "type_text"
+            ]
+        );
+        for tool in &tools {
+            let description = tool.description.as_ref().expect("tool description");
+            assert!(!description.is_empty(), "{} has no description", tool.name);
+            assert_eq!(
+                tool.input_schema.get("type").and_then(|value| value.as_str()),
+                Some("object"),
+                "{} has no object input schema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn schema_documents_required_and_optional_parameters() {
+        let tools = LibvirtTools::tool_router().list_all();
+        let screenshot = tools
+            .iter()
+            .find(|tool| tool.name == "screenshot")
+            .expect("screenshot tool");
+        let properties = &screenshot.input_schema["properties"];
+        assert_eq!(properties["domain"]["type"], "string");
+        // Optional fields are nullable integers in the generated schema.
+        assert_eq!(properties["wait_ms"]["type"], serde_json::json!(["integer", "null"]));
+        assert_eq!(screenshot.input_schema["required"], serde_json::json!(["domain"]));
+        // Field doc comments are the property descriptions.
+        let description = properties["wait_ms"]["description"]
+            .as_str()
+            .expect("wait_ms description");
+        assert!(description.contains("default 500"), "got: {}", description);
+
+        let list_domains = tools
+            .iter()
+            .find(|tool| tool.name == "list_domains")
+            .expect("list_domains tool");
+        assert_eq!(list_domains.input_schema["properties"], serde_json::json!({}));
+        assert_eq!(list_domains.input_schema["type"], "object");
+    }
+
+    #[test]
+    fn schema_advertises_the_button_and_direction_enums() {
+        let tools = LibvirtTools::tool_router().list_all();
+        let mouse_click = tools
+            .iter()
+            .find(|tool| tool.name == "mouse_click")
+            .expect("mouse_click tool");
+        assert_eq!(
+            referenced_definition(&mouse_click.input_schema, "button")["enum"],
+            serde_json::json!(["left", "middle", "right"])
+        );
+        assert_eq!(
+            mouse_click.input_schema["required"],
+            serde_json::json!(["domain", "button"])
+        );
+
+        let mouse_scroll = tools
+            .iter()
+            .find(|tool| tool.name == "mouse_scroll")
+            .expect("mouse_scroll tool");
+        assert_eq!(
+            referenced_definition(&mouse_scroll.input_schema, "direction")["enum"],
+            serde_json::json!(["up", "down"])
         );
     }
 
-    #[test]
-    fn initialized_notification_has_no_reply() {
-        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(server().handle_line(line).is_none());
-        let cancelled = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
-        assert!(server().handle_line(cancelled).is_none());
-    }
-
-    #[test]
-    fn ping_returns_empty_object() {
-        let line = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;
-        let response = server().handle_line(line).expect("ping needs a reply");
-        assert_eq!(response["result"], json!({}));
-    }
-
-    #[test]
-    fn tools_list_returns_all_tools() {
-        let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-        let response = server().handle_line(line).expect("tools/list needs a reply");
-        let tools = response["result"]["tools"]
-            .as_array()
-            .expect("tools must be an array");
-        assert_eq!(tools.len(), 8);
-        assert_eq!(tools[0]["name"], "list_domains");
-        assert_eq!(tools[0]["inputSchema"]["type"], "object");
-    }
-
-    #[test]
-    fn tools_call_unknown_tool_is_an_error_result() {
-        let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#;
-        let response = server().handle_line(line).expect("tools/call needs a reply");
-        assert_eq!(response["result"]["isError"], true);
-        assert_eq!(response["result"]["content"][0]["type"], "text");
-        let text = response["result"]["content"][0]["text"]
+    /// Follow the `$ref` of a property to the definition it points at.
+    fn referenced_definition<'a>(
+        schema: &'a serde_json::Map<String, serde_json::Value>,
+        property: &str,
+    ) -> &'a serde_json::Value {
+        let reference = schema["properties"][property]["$ref"]
             .as_str()
-            .expect("error text");
-        assert!(text.contains("unknown tool"), "got: {}", text);
+            .expect("property must reference a definition");
+        let name = reference.rsplit('/').next().expect("definition name");
+        &schema["$defs"][name]
     }
 
     #[test]
-    fn tools_call_without_name_is_an_error_result() {
-        let line = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{}}"#;
-        let response = server().handle_line(line).expect("tools/call needs a reply");
-        assert_eq!(response["result"]["isError"], true);
+    fn router_only_routes_declared_tools() {
+        let router = LibvirtTools::tool_router();
+        assert!(router.get("screenshot").is_some());
+        assert!(router.get("teleport").is_none());
     }
 
     #[test]
-    fn unknown_method_reports_method_not_found() {
-        let line = r#"{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{}}"#;
-        let response = server().handle_line(line).expect("request needs a reply");
-        assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
-        assert_eq!(response["id"], 5);
-        let text = response["error"]["message"].as_str().expect("message");
-        assert!(text.contains("resources/list"), "got: {}", text);
+    fn server_name_and_version_are_reported() {
+        let info = ServerHandler::get_info(&server());
+        assert_eq!(info.server_info.name, SERVER_NAME);
+        assert_eq!(info.server_info.version, SERVER_VERSION);
+        assert!(info.capabilities.tools.is_some(), "tools capability missing");
     }
 
-    #[test]
-    fn malformed_json_is_a_parse_error() {
-        let response = server().handle_line("{not json").expect("parse error needs a reply");
-        assert_eq!(response["error"]["code"], PARSE_ERROR);
-        assert!(response["id"].is_null());
+    #[tokio::test]
+    async fn operation_errors_are_tool_errors_with_text() {
+        let result = server()
+            .mouse_click(Parameters(MouseClickParams {
+                domain: "Windows10".to_string(),
+                button: MouseButton::Left,
+                x: Some(3),
+                y: None,
+                double_click: None,
+            }))
+            .await
+            .expect("tool-level failures are results, not protocol errors");
+        assert_eq!(result.is_error, Some(true));
+        let text = tool_result_text(&result);
+        assert!(text.contains("'x' and 'y'"), "got: {}", text);
     }
 
-    #[test]
-    fn non_object_message_is_an_invalid_request() {
-        let response = server().handle_line("[1,2,3]").expect("invalid request needs a reply");
-        assert_eq!(response["error"]["code"], INVALID_REQUEST);
-    }
-
-    #[test]
-    fn request_without_method_is_an_invalid_request() {
-        let response = server()
-            .handle_line(r#"{"jsonrpc":"2.0","id":6}"#)
-            .expect("invalid request needs a reply");
-        assert_eq!(response["error"]["code"], INVALID_REQUEST);
-        assert_eq!(response["id"], 6);
-    }
-
-    #[test]
-    fn response_line_is_single_line_json() {
-        let line = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
-        let response = server().handle_line(line).expect("ping needs a reply");
-        let encoded = serde_json::to_string(&response).expect("encodable");
-        assert!(!encoded.contains('\n'));
+    #[tokio::test]
+    async fn libvirt_failures_are_readable_tool_errors() {
+        let result = server()
+            .mouse_scroll(Parameters(MouseScrollParams {
+                domain: "unreachable-domain".to_string(),
+                direction: ScrollDirection::Down,
+                clicks: Some(2),
+            }))
+            .await
+            .expect("tool-level failures are results, not protocol errors");
+        // Whatever libvirt says, the caller gets a readable error, never a
+        // panic and never a bare protocol error.
+        assert_eq!(result.is_error, Some(true));
+        let text = tool_result_text(&result);
+        assert!(!text.is_empty(), "the error must reach the caller as text");
     }
 }
