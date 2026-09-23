@@ -1097,7 +1097,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp-libvirt"
+name = "mcp-libvirt-vm-use"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",

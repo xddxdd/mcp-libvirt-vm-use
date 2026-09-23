@@ -1,4 +1,4 @@
-//! mcp-libvirt: an MCP server that drives libvirt domains over SPICE.
+//! mcp-libvirt-vm-use: an MCP server that drives libvirt domains over SPICE.
 //!
 //! `main.rs` is the crate root (there is no `lib.rs`). It builds the libvirt
 //! handle and serves the MCP protocol on stdio; stdout belongs to the `rmcp`

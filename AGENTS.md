@@ -1,4 +1,4 @@
-# AGENTS.md — mcp-libvirt 项目说明
+# AGENTS.md — mcp-libvirt-vm-use 项目说明
 
 Rust 实现的 MCP (Model Context Protocol) server：通过 libvirt 管理虚拟机，通过 SPICE 协议对 VM 执行屏幕截图与键鼠控制。
 

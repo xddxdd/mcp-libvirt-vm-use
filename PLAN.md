@@ -1,4 +1,4 @@
-# PLAN: mcp-libvirt — MCP server for libvirt VMs over SPICE
+# PLAN: mcp-libvirt-vm-use — MCP server for libvirt VMs over SPICE
 
 Rust MCP server (stdio) exposing libvirt VM control: list domains, take screenshots,
 and send keyboard/mouse input to VMs via the SPICE protocol.
@@ -14,7 +14,7 @@ and send keyboard/mouse input to VMs via the SPICE protocol.
 
 ## Architecture
 
-Single binary crate `mcp-libvirt`. The MCP layer is async (`rmcp` + tokio, stdio transport);
+Single binary crate `mcp-libvirt-vm-use`. The MCP layer is async (`rmcp` + tokio, stdio transport);
 the SPICE client is a short-lived synchronous TCP/unix client per operation (wrapped in spawn_blocking).
 
 ```
@@ -266,7 +266,7 @@ impl LibvirtTools {
     async fn screenshot(&self, Parameters(ScreenshotParams { domain, wait_ms }): Parameters<ScreenshotParams>)
         -> Result<CallToolResult, rmcp::ErrorData> { ... }
 }
-#[tool_handler(name = "mcp-libvirt", version = "0.1.0")]
+#[tool_handler(name = "mcp-libvirt-vm-use", version = "0.1.0")]
 impl ServerHandler for LibvirtTools {}
 
 #[tokio::main]
@@ -340,7 +340,7 @@ devShell should not.)
 
 ```toml
 [package]
-name = "mcp-libvirt"
+name = "mcp-libvirt-vm-use"
 version = "0.1.0"
 edition = "2021"
 

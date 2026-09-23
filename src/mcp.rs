@@ -21,7 +21,7 @@ use crate::tools::{
     ScreenshotParams, TypeTextParams,
 };
 
-pub const SERVER_NAME: &str = "mcp-libvirt";
+pub const SERVER_NAME: &str = "mcp-libvirt-vm-use";
 pub const SERVER_VERSION: &str = "0.1.0";
 
 #[derive(Clone)]
@@ -113,7 +113,7 @@ impl LibvirtTools {
     }
 }
 
-#[tool_handler(router = self.tool_router, name = "mcp-libvirt", version = "0.1.0")]
+#[tool_handler(router = self.tool_router, name = "mcp-libvirt-vm-use", version = "0.1.0")]
 impl ServerHandler for LibvirtTools {}
 
 /// Turn a tool implementation result into an MCP result: operational failures

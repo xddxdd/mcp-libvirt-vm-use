@@ -1,5 +1,5 @@
 {
-  description = "mcp-libvirt: MCP server for libvirt VMs over SPICE";
+  description = "mcp-libvirt-vm-use: MCP server for libvirt VMs over SPICE";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
