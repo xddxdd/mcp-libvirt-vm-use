@@ -1,19 +1,20 @@
-//! Tool parameter schemas and the synchronous implementation of every tool.
+//! Tool parameter schemas and the implementation of every tool.
 //!
 //! `rmcp` derives each tool's JSON Schema from these parameter structs (field
-//! doc comments become the property descriptions), and `mcp.rs` calls the
-//! functions below from `tokio::task::spawn_blocking`.
+//! doc comments become the property descriptions), and `mcp.rs` awaits these
+//! functions from its async handlers.
 //!
-//! Every tool that touches a guest resolves its domain through `libvirt`, opens
-//! a fresh `SpiceSession`, performs the operation and drops the connection —
-//! connections are never pooled.
+//! Every tool that touches a guest resolves its domain through `libvirt` (the
+//! only part that runs on the blocking pool, since `virt` is synchronous FFI),
+//! opens a fresh `SpiceSession`, performs the operation and drops the
+//! connection — connections are never pooled.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use rmcp::model::ContentBlock;
 use rmcp::schemars;
 
-use crate::libvirt::{DomainInfo, Libvirt};
+use crate::libvirt::{DomainInfo, Libvirt, SpiceEndpoint};
 use crate::spice::{Button, ScrollDir, SpiceSession};
 
 const DEFAULT_SCREENSHOT_WAIT_MS: u32 = 500;
@@ -118,10 +119,13 @@ pub fn list_domains(libvirt: &Libvirt) -> Result<Vec<ContentBlock>, String> {
 }
 
 /// `screenshot`: one PNG image block plus a text block with the dimensions.
-pub fn screenshot(libvirt: &Libvirt, params: ScreenshotParams) -> Result<Vec<ContentBlock>, String> {
+pub async fn screenshot(
+    libvirt: &Libvirt,
+    params: ScreenshotParams,
+) -> Result<Vec<ContentBlock>, String> {
     let wait_ms = params.wait_ms.unwrap_or(DEFAULT_SCREENSHOT_WAIT_MS);
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    let image = session.screenshot(wait_ms)?;
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    let image = session.screenshot(wait_ms).await?;
     Ok(vec![
         ContentBlock::image(BASE64.encode(&image.png), "image/png"),
         ContentBlock::text(format!(
@@ -135,10 +139,13 @@ pub fn screenshot(libvirt: &Libvirt, params: ScreenshotParams) -> Result<Vec<Con
 }
 
 /// `type_text`: type ASCII text through the SPICE inputs channel.
-pub fn type_text(libvirt: &Libvirt, params: TypeTextParams) -> Result<Vec<ContentBlock>, String> {
+pub async fn type_text(
+    libvirt: &Libvirt,
+    params: TypeTextParams,
+) -> Result<Vec<ContentBlock>, String> {
     let interval_ms = params.interval_ms.unwrap_or(DEFAULT_TYPE_INTERVAL_MS);
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    session.type_text(&params.text, interval_ms)?;
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    session.type_text(&params.text, interval_ms).await?;
     Ok(vec![ContentBlock::text(format!(
         "typed {} character(s) into '{}'",
         params.text.chars().count(),
@@ -147,9 +154,12 @@ pub fn type_text(libvirt: &Libvirt, params: TypeTextParams) -> Result<Vec<Conten
 }
 
 /// `key_press`: send a key combination such as `ctrl+alt+t`.
-pub fn key_press(libvirt: &Libvirt, params: KeyPressParams) -> Result<Vec<ContentBlock>, String> {
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    session.key_press(&params.keys)?;
+pub async fn key_press(
+    libvirt: &Libvirt,
+    params: KeyPressParams,
+) -> Result<Vec<ContentBlock>, String> {
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    session.key_press(&params.keys).await?;
     Ok(vec![ContentBlock::text(format!(
         "sent key combination '{}' to '{}'",
         params.keys, params.domain
@@ -157,9 +167,12 @@ pub fn key_press(libvirt: &Libvirt, params: KeyPressParams) -> Result<Vec<Conten
 }
 
 /// `mouse_move`: move the pointer to an absolute position.
-pub fn mouse_move(libvirt: &Libvirt, params: MouseMoveParams) -> Result<Vec<ContentBlock>, String> {
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    session.mouse_move(params.x, params.y)?;
+pub async fn mouse_move(
+    libvirt: &Libvirt,
+    params: MouseMoveParams,
+) -> Result<Vec<ContentBlock>, String> {
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    session.mouse_move(params.x, params.y).await?;
     Ok(vec![ContentBlock::text(format!(
         "moved mouse to ({}, {}) on '{}'",
         params.x, params.y, params.domain
@@ -167,7 +180,7 @@ pub fn mouse_move(libvirt: &Libvirt, params: MouseMoveParams) -> Result<Vec<Cont
 }
 
 /// `mouse_click`: optionally move first, then press and release one button.
-pub fn mouse_click(
+pub async fn mouse_click(
     libvirt: &Libvirt,
     params: MouseClickParams,
 ) -> Result<Vec<ContentBlock>, String> {
@@ -180,13 +193,10 @@ pub fn mouse_click(
         _ => String::new(),
     };
 
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    session.mouse_click(
-        mouse_button(params.button),
-        params.x,
-        params.y,
-        double,
-    )?;
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    session
+        .mouse_click(mouse_button(params.button), params.x, params.y, double)
+        .await?;
     let action = if double { "double-clicked" } else { "clicked" };
     Ok(vec![ContentBlock::text(format!(
         "{} {} button{} on '{}'",
@@ -198,13 +208,15 @@ pub fn mouse_click(
 }
 
 /// `mouse_scroll`: press and release the wheel button a number of times.
-pub fn mouse_scroll(
+pub async fn mouse_scroll(
     libvirt: &Libvirt,
     params: MouseScrollParams,
 ) -> Result<Vec<ContentBlock>, String> {
     let clicks = params.clicks.unwrap_or(DEFAULT_SCROLL_CLICKS);
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    session.mouse_scroll(scroll_direction(params.direction), clicks)?;
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    session
+        .mouse_scroll(scroll_direction(params.direction), clicks)
+        .await?;
     Ok(vec![ContentBlock::text(format!(
         "scrolled {} {} click(s) on '{}'",
         scroll_direction_name(params.direction),
@@ -214,19 +226,43 @@ pub fn mouse_scroll(
 }
 
 /// `mouse_drag`: press the left button, drag to another position, release.
-pub fn mouse_drag(libvirt: &Libvirt, params: MouseDragParams) -> Result<Vec<ContentBlock>, String> {
-    let mut session = connect_spice(libvirt, &params.domain)?;
-    session.mouse_drag((params.from_x, params.from_y), (params.to_x, params.to_y))?;
+pub async fn mouse_drag(
+    libvirt: &Libvirt,
+    params: MouseDragParams,
+) -> Result<Vec<ContentBlock>, String> {
+    let mut session = connect_spice(libvirt, &params.domain).await?;
+    session
+        .mouse_drag((params.from_x, params.from_y), (params.to_x, params.to_y))
+        .await?;
     Ok(vec![ContentBlock::text(format!(
         "dragged ({}, {}) -> ({}, {}) on '{}'",
         params.from_x, params.from_y, params.to_x, params.to_y, params.domain
     ))])
 }
 
-/// Resolve a domain name to a SPICE endpoint and open a fresh session.
-fn connect_spice(libvirt: &Libvirt, domain: &str) -> Result<SpiceSession, String> {
+/// Resolve a domain name to a SPICE endpoint, then open a fresh session.
+async fn connect_spice(libvirt: &Libvirt, domain: &str) -> Result<SpiceSession, String> {
+    // `virt` is synchronous FFI, so the lookup runs on the blocking pool. The
+    // handle is a plain URI, so it can be rebuilt for the `'static` closure.
+    let handle = Libvirt {
+        uri: libvirt.uri.clone(),
+    };
+    let name = domain.to_string();
+    let (endpoint, password) = tokio::task::spawn_blocking(move || resolve_endpoint(&handle, &name))
+        .await
+        .map_err(|e| {
+            format!(
+                "internal error while resolving domain '{}': {}",
+                domain, e
+            )
+        })??;
+    SpiceSession::connect(&endpoint, &password).await
+}
+
+/// Blocking half of [`connect_spice`]: domain lookup, endpoint check, password.
+fn resolve_endpoint(libvirt: &Libvirt, domain: &str) -> Result<(SpiceEndpoint, String), String> {
     let info = libvirt.domain(domain)?;
-    let endpoint = match info.spice.as_ref() {
+    let endpoint = match info.spice {
         Some(endpoint) => endpoint,
         None => {
             return Err(format!(
@@ -240,7 +276,7 @@ fn connect_spice(libvirt: &Libvirt, domain: &str) -> Result<SpiceSession, String
         Ok(value) => value,
         Err(_) => String::new(),
     };
-    SpiceSession::connect(endpoint, &password)
+    Ok((endpoint, password))
 }
 
 fn mouse_button(button: MouseButton) -> Button {
@@ -376,8 +412,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn mouse_click_requires_both_coordinates() {
+    #[tokio::test]
+    async fn mouse_click_requires_both_coordinates() {
         let libvirt = test_libvirt();
         let error = mouse_click(
             &libvirt,
@@ -389,12 +425,13 @@ mod tests {
                 double_click: None,
             },
         )
+        .await
         .expect_err("x without y must be rejected");
         assert!(error.contains("'x' and 'y'"), "got: {}", error);
     }
 
-    #[test]
-    fn unknown_domain_is_reported_by_the_libvirt_layer() {
+    #[tokio::test]
+    async fn unknown_domain_is_reported_by_the_libvirt_layer() {
         // The libvirt test driver needs no daemon, so the failure is always the
         // missing domain rather than an unreachable hypervisor.
         let libvirt = Libvirt {
@@ -407,8 +444,40 @@ mod tests {
                 wait_ms: None,
             },
         )
+        .await
         .expect_err("a missing domain must be an error");
         assert!(error.contains("nope"), "got: {}", error);
+    }
+
+    #[tokio::test]
+    async fn domain_without_a_spice_endpoint_reports_it() {
+        // `test:///default` defines a single domain that is running but has no
+        // graphics device of any kind.
+        let libvirt = Libvirt {
+            uri: "test:///default".to_string(),
+        };
+        let list = list_domains(&libvirt).expect("the test driver lists one domain");
+        let table = text_of(&list);
+        assert!(table.starts_with("NAME"), "got: {}", table);
+        let name = table
+            .lines()
+            .nth(1)
+            .expect("one domain row")
+            .split_whitespace()
+            .next()
+            .expect("domain name")
+            .to_string();
+        let error = type_text(
+            &libvirt,
+            TypeTextParams {
+                domain: name,
+                text: "a".to_string(),
+                interval_ms: None,
+            },
+        )
+        .await
+        .expect_err("the domain has no SPICE display");
+        assert!(error.contains("no SPICE display endpoint"), "got: {}", error);
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! `rmcp` glue: the tool router, the async tool handlers and the server handler.
 //!
-//! Tool parameter structs and the synchronous implementation of every tool live
-//! in [`crate::tools`]; this module only adapts them to the MCP layer. The
-//! server name and version are literals in the `#[tool]`/`#[tool_handler]`
-//! attributes below (the macros require literals); the constants here are used
-//! for the startup diagnostics on stderr.
+//! Tool parameter structs and the implementation of every tool live in
+//! [`crate::tools`]; this module only adapts them to the MCP layer. SPICE
+//! operations are awaited directly (they are async); only the libvirt lookup
+//! inside them runs on the blocking pool. The server name and version are
+//! literals in the `#[tool]`/`#[tool_handler]` attributes below (the macros
+//! require literals); the constants here are used for the startup diagnostics
+//! on stderr.
 
 use std::sync::Arc;
 
@@ -40,7 +42,7 @@ impl LibvirtTools {
     #[tool(description = "List all libvirt domains with their id, state and SPICE display endpoint.")]
     async fn list_domains(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::list_domains(&libvirt)).await)
+        Ok(blocking_libvirt(move || tools::list_domains(&libvirt)).await)
     }
 
     #[tool(description = "Capture the SPICE display of a domain and return it as a PNG image.")]
@@ -49,7 +51,7 @@ impl LibvirtTools {
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::screenshot(&libvirt, params)).await)
+        Ok(tool_result(tools::screenshot(&libvirt, params).await))
     }
 
     #[tool(description = "Type ASCII text into a domain through the SPICE inputs channel.")]
@@ -58,7 +60,7 @@ impl LibvirtTools {
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::type_text(&libvirt, params)).await)
+        Ok(tool_result(tools::type_text(&libvirt, params).await))
     }
 
     #[tool(
@@ -69,7 +71,7 @@ impl LibvirtTools {
         Parameters(params): Parameters<KeyPressParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::key_press(&libvirt, params)).await)
+        Ok(tool_result(tools::key_press(&libvirt, params).await))
     }
 
     #[tool(description = "Move the mouse pointer to an absolute position inside a domain's display.")]
@@ -78,7 +80,7 @@ impl LibvirtTools {
         Parameters(params): Parameters<MouseMoveParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::mouse_move(&libvirt, params)).await)
+        Ok(tool_result(tools::mouse_move(&libvirt, params).await))
     }
 
     #[tool(description = "Click a mouse button in a domain, optionally moving to a position first.")]
@@ -87,7 +89,7 @@ impl LibvirtTools {
         Parameters(params): Parameters<MouseClickParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::mouse_click(&libvirt, params)).await)
+        Ok(tool_result(tools::mouse_click(&libvirt, params).await))
     }
 
     #[tool(description = "Scroll the mouse wheel inside a domain's display.")]
@@ -96,7 +98,7 @@ impl LibvirtTools {
         Parameters(params): Parameters<MouseScrollParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::mouse_scroll(&libvirt, params)).await)
+        Ok(tool_result(tools::mouse_scroll(&libvirt, params).await))
     }
 
     #[tool(
@@ -107,22 +109,29 @@ impl LibvirtTools {
         Parameters(params): Parameters<MouseDragParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let libvirt = Arc::clone(&self.libvirt);
-        Ok(blocking(move || tools::mouse_drag(&libvirt, params)).await)
+        Ok(tool_result(tools::mouse_drag(&libvirt, params).await))
     }
 }
 
 #[tool_handler(router = self.tool_router, name = "mcp-libvirt", version = "0.1.0")]
 impl ServerHandler for LibvirtTools {}
 
-/// Run a synchronous tool implementation off the async runtime. Tool failures
+/// Turn a tool implementation result into an MCP result: operational failures
 /// are reported as `isError` content so the caller sees the message.
-async fn blocking<F>(operation: F) -> CallToolResult
+fn tool_result(result: Result<Vec<ContentBlock>, String>) -> CallToolResult {
+    match result {
+        Ok(content) => CallToolResult::success(content),
+        Err(message) => CallToolResult::error(vec![ContentBlock::text(message)]),
+    }
+}
+
+/// Run a synchronous libvirt-only tool implementation off the async runtime.
+async fn blocking_libvirt<F>(operation: F) -> CallToolResult
 where
     F: FnOnce() -> Result<Vec<ContentBlock>, String> + Send + 'static,
 {
     match tokio::task::spawn_blocking(operation).await {
-        Ok(Ok(content)) => CallToolResult::success(content),
-        Ok(Err(message)) => CallToolResult::error(vec![ContentBlock::text(message)]),
+        Ok(result) => tool_result(result),
         Err(join_error) => CallToolResult::error(vec![ContentBlock::text(format!(
             "internal error while running the tool: {}",
             join_error

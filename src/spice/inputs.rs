@@ -1,48 +1,23 @@
-//! SPICE inputs channel: AT set-1 keyboard scancodes and keyboard/mouse payloads.
+//! SPICE keyboard input: the verified AT set-1 scancode tables and the key
+//! sequences streamed into the ryll inputs channel.
 //!
 //! Ported from the reference client in `docs/spice-html5`:
 //! * `code_to_scancode.js` — the key name to scancode table (every entry ported);
 //! * `utils.js` — `keycode_to_start_scan` / `keycode_to_end_scan` (break-bit encoding);
-//! * `inputs.js` — `typeText` timing and the US-layout character table;
-//! * `docs/spice.proto` / `docs/enums.h` — the exact client message bodies and values.
+//! * `inputs.js` — `typeText` timing and the US-layout character table.
 //!
-//! The `SPICE_MSGC_INPUTS_*` and `SPICE_MOUSE_*` values repeat the numbers from
-//! `docs/spice-protocol/enums.h` rather than importing them from
-//! [`crate::spice::proto`], so this module does not depend on how `proto.rs` names
-//! its constants. All integers are little-endian on the wire.
-//!
-//! As in `proto.rs`, the value tables below are deliberately complete: a value
-//! that only a sibling module or the unit tests read is not dead code.
-#![allow(dead_code)]
+//! Events are [`InputEvent::KeyDown`] / [`InputEvent::KeyUp`] carrying the
+//! scancodes the SPICE inputs channel expects on the wire: one byte for plain
+//! keys, `0xE0 | (make << 8)` for extended (E0-prefixed) keys.
 
-use crate::spice::Button;
+use shakenfist_spice_renderer::InputEvent;
 
-/// One inputs-channel event: wait `delay_ms`, then send message `msg_type` with
-/// `payload` as its body. The first event of a sequence carries delay 0, so the
-/// events can be run in order without a leading sleep.
-pub type InputEvent = (u16, u16, Vec<u8>);
-
-// Client message types, `docs/enums.h` (InputsChannel in `docs/spice.proto`).
-pub const SPICE_MSGC_INPUTS_KEY_DOWN: u16 = 101;
-pub const SPICE_MSGC_INPUTS_KEY_UP: u16 = 102;
-pub const SPICE_MSGC_INPUTS_MOUSE_MOTION: u16 = 111;
-pub const SPICE_MSGC_INPUTS_MOUSE_POSITION: u16 = 112;
-pub const SPICE_MSGC_INPUTS_MOUSE_PRESS: u16 = 113;
-pub const SPICE_MSGC_INPUTS_MOUSE_RELEASE: u16 = 114;
-
-// Mouse buttons and button masks, `docs/enums.h`. Wheel buttons are not part of
-// `Button`, but `mouse_scroll` sends them through the press/release payloads.
-pub const SPICE_MOUSE_BUTTON_LEFT: u8 = 1;
-pub const SPICE_MOUSE_BUTTON_MIDDLE: u8 = 2;
-pub const SPICE_MOUSE_BUTTON_RIGHT: u8 = 3;
-pub const SPICE_MOUSE_BUTTON_UP: u8 = 4;
-pub const SPICE_MOUSE_BUTTON_DOWN: u8 = 5;
-
-pub const SPICE_MOUSE_BUTTON_MASK_LEFT: u16 = 1 << 0;
-pub const SPICE_MOUSE_BUTTON_MASK_MIDDLE: u16 = 1 << 1;
-pub const SPICE_MOUSE_BUTTON_MASK_RIGHT: u16 = 1 << 2;
-pub const SPICE_MOUSE_BUTTON_MASK_UP: u16 = 1 << 3;
-pub const SPICE_MOUSE_BUTTON_MASK_DOWN: u16 = 1 << 4;
+/// One streamed keystroke: wait `delay_ms`, then send `event`.
+#[derive(Debug, Clone)]
+pub struct KeyStep {
+    pub delay_ms: u16,
+    pub event: InputEvent,
+}
 
 /// AT set-1 make code of the left Shift key (used for shifted characters).
 const SCAN_SHIFT_LEFT: u16 = 0x2A;
@@ -316,10 +291,10 @@ const US_PUNCTUATION: &[(char, char, &str)] = &[
 /// A resolved keystroke: an AT set-1 make code, whether it needs the `0xE0`
 /// prefix, and whether Shift has to be held for the intended character to appear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyStroke {
-    pub make: u16,
-    pub extended: bool,
-    pub shift: bool,
+struct KeyStroke {
+    make: u16,
+    extended: bool,
+    shift: bool,
 }
 
 /// Split a raw [`CODE_TO_SCANCODE`] value into (make code, extended flag).
@@ -357,7 +332,7 @@ fn lookup_code_name_ci(name: &str) -> Option<u16> {
 
 /// The scancode sent on a key-down for a make code: plain keys are one byte,
 /// extended keys are `0xE0 | (make << 8)` (`utils.js::keycode_to_start_scan`).
-pub fn key_down_code(make: u16, extended: bool) -> u32 {
+fn key_down_code(make: u16, extended: bool) -> u32 {
     if extended {
         0xE0 | ((make as u32) << 8)
     } else {
@@ -368,17 +343,12 @@ pub fn key_down_code(make: u16, extended: bool) -> u32 {
 /// The scancode sent on a key-up: the make code with the break bit, which is
 /// `| 0x80` for one-byte scancodes and `| 0x8000` for extended ones
 /// (`utils.js::keycode_to_end_scan`).
-pub fn key_up_code(make: u16, extended: bool) -> u32 {
+fn key_up_code(make: u16, extended: bool) -> u32 {
     if extended {
         0x8000 | key_down_code(make, true)
     } else {
         (make | 0x80) as u32
     }
-}
-
-/// Body of `SPICE_MSGC_INPUTS_KEY_DOWN` / `KEY_UP`: the scancode as a `u32`.
-pub fn key_payload(code: u32) -> Vec<u8> {
-    code.to_le_bytes().to_vec()
 }
 
 /// Resolve a key name to (make code, extended flag). Accepts every
@@ -389,7 +359,7 @@ pub fn key_payload(code: u32) -> Vec<u8> {
 /// The return value cannot express Shift, so a shifted symbol such as `"+"` maps to
 /// its physical key (`Equal`) without the Shift that would produce a `+`. Callers
 /// that need the character rather than the key want [`char_to_scancode`].
-pub fn key_name_to_scancode(name: &str) -> Option<(u16, bool)> {
+fn key_name_to_scancode(name: &str) -> Option<(u16, bool)> {
     let trimmed = name.trim();
     if let Some(value) = lookup_code_name(trimmed).or_else(|| lookup_code_name_ci(trimmed)) {
         return Some(split_scan(value));
@@ -433,7 +403,7 @@ pub fn key_name_to_scancode(name: &str) -> Option<(u16, bool)> {
 /// including whether Shift is needed (the `US_TYPEABLE` table and `typeText` in
 /// `docs/spice-html5/inputs.js`). Non-ASCII characters have no US-layout key and are
 /// rejected with an error naming the character.
-pub fn char_to_scancode(c: char) -> Result<KeyStroke, String> {
+fn char_to_scancode(c: char) -> Result<KeyStroke, String> {
     let (name, shift) = if c.is_ascii_lowercase() {
         (format!("Key{}", c.to_ascii_uppercase()), false)
     } else if c.is_ascii_uppercase() {
@@ -471,82 +441,56 @@ pub fn char_to_scancode(c: char) -> Result<KeyStroke, String> {
     })
 }
 
-/// Build the key-down / key-up / Shift events that type one character. `delay` is
-/// the wait before the first of them (0 for the first character of a string).
-fn push_stroke(events: &mut Vec<InputEvent>, stroke: KeyStroke, delay: u16) {
+/// Append the key-down / key-up events that type one character. `delay` is the
+/// wait before the first of them (0 for the first character of a string).
+fn push_stroke(steps: &mut Vec<KeyStep>, stroke: KeyStroke, delay: u16) {
+    let key_down = |make: u16, extended: bool, delay: u16| KeyStep {
+        delay_ms: delay,
+        event: InputEvent::KeyDown(key_down_code(make, extended)),
+    };
+    let key_up = |make: u16, extended: bool, delay: u16| KeyStep {
+        delay_ms: delay,
+        event: InputEvent::KeyUp(key_up_code(make, extended)),
+    };
+
     if stroke.shift {
-        events.push((
-            delay,
-            SPICE_MSGC_INPUTS_KEY_DOWN,
-            key_payload(key_down_code(SCAN_SHIFT_LEFT, false)),
-        ));
-        events.push((
-            SHIFT_SETTLE_MS,
-            SPICE_MSGC_INPUTS_KEY_DOWN,
-            key_payload(key_down_code(stroke.make, stroke.extended)),
-        ));
-        events.push((
-            KEY_HOLD_MS,
-            SPICE_MSGC_INPUTS_KEY_UP,
-            key_payload(key_up_code(stroke.make, stroke.extended)),
-        ));
-        events.push((
-            SHIFT_SETTLE_MS,
-            SPICE_MSGC_INPUTS_KEY_UP,
-            key_payload(key_up_code(SCAN_SHIFT_LEFT, false)),
-        ));
+        steps.push(key_down(SCAN_SHIFT_LEFT, false, delay));
+        steps.push(key_down(stroke.make, stroke.extended, SHIFT_SETTLE_MS));
+        steps.push(key_up(stroke.make, stroke.extended, KEY_HOLD_MS));
+        steps.push(key_up(SCAN_SHIFT_LEFT, false, SHIFT_SETTLE_MS));
     } else {
-        events.push((
-            delay,
-            SPICE_MSGC_INPUTS_KEY_DOWN,
-            key_payload(key_down_code(stroke.make, stroke.extended)),
-        ));
-        events.push((
-            KEY_HOLD_MS,
-            SPICE_MSGC_INPUTS_KEY_UP,
-            key_payload(key_up_code(stroke.make, stroke.extended)),
-        ));
+        steps.push(key_down(stroke.make, stroke.extended, delay));
+        steps.push(key_up(stroke.make, stroke.extended, KEY_HOLD_MS));
     }
 }
 
-/// Event list that types `text` on a US layout, paced by `interval_ms` between
+/// Key steps that type `text` on a US layout, paced by `interval_ms` between
 /// characters. Each character is a key-down followed by a key-up `KEY_HOLD_MS`
 /// later, with Shift pressed and released around shifted characters. Carriage
 /// returns are folded into a single Enter (`typeText` in `inputs.js`).
 ///
-/// This is the PLAN.md signature and has no way to report a character it cannot
-/// type: un-typeable text yields an empty list. Call [`try_type_text_events`]
-/// (which `SpiceSession::type_text` should use) to get the error instead.
-pub fn type_text_events(text: &str, interval_ms: u64) -> Vec<InputEvent> {
-    match try_type_text_events(text, interval_ms) {
-        Ok(events) => events,
-        Err(_) => Vec::new(),
-    }
-}
-
-/// [`type_text_events`] with the error channel: rejects characters the US layout
-/// cannot produce (see [`char_to_scancode`]).
-pub fn try_type_text_events(text: &str, interval_ms: u64) -> Result<Vec<InputEvent>, String> {
+/// Characters the US layout cannot produce are rejected with a clear error.
+pub fn type_text_events(text: &str, interval_ms: u64) -> Result<Vec<KeyStep>, String> {
     // A CRLF must land as a single Enter, not Enter twice.
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    // Delays are u16 on the wire contract, and a very short gap makes guests drop
-    // characters, so the interval is floored and capped.
+    // Delays are u16 in the renderer's event pacing, and a very short gap makes
+    // guests drop characters, so the interval is floored and capped.
     let interval = interval_ms.clamp(MIN_TYPE_INTERVAL_MS as u64, u16::MAX as u64) as u16;
 
-    let mut events = Vec::new();
+    let mut steps = Vec::new();
     let mut delay = 0u16;
     for c in text.chars() {
         let stroke = char_to_scancode(c)?;
-        push_stroke(&mut events, stroke, delay);
+        push_stroke(&mut steps, stroke, delay);
         delay = interval;
     }
-    Ok(events)
+    Ok(steps)
 }
 
-/// Event list for a key combination such as `"ctrl+alt+t"`: all keys are pressed
+/// Key steps for a key combination such as `"ctrl+alt+t"`: all keys are pressed
 /// left to right, then released in reverse, `COMBO_DELAY_MS` apart. A symbol that
 /// needs Shift gets a synthetic left Shift unless the combo already names one.
-pub fn key_combo_events(combo: &str) -> Result<Vec<InputEvent>, String> {
+pub fn key_combo_events(combo: &str) -> Result<Vec<KeyStep>, String> {
     let mut strokes: Vec<KeyStroke> = Vec::new();
     for token in combo.split('+') {
         let token = token.trim();
@@ -600,93 +544,23 @@ pub fn key_combo_events(combo: &str) -> Result<Vec<InputEvent>, String> {
         );
     }
 
-    let mut events = Vec::new();
+    let mut steps = Vec::new();
     let mut delay = 0u16;
     for stroke in &strokes {
-        events.push((
-            delay,
-            SPICE_MSGC_INPUTS_KEY_DOWN,
-            key_payload(key_down_code(stroke.make, stroke.extended)),
-        ));
+        steps.push(KeyStep {
+            delay_ms: delay,
+            event: InputEvent::KeyDown(key_down_code(stroke.make, stroke.extended)),
+        });
         delay = COMBO_DELAY_MS;
     }
     for stroke in strokes.iter().rev() {
-        events.push((
-            delay,
-            SPICE_MSGC_INPUTS_KEY_UP,
-            key_payload(key_up_code(stroke.make, stroke.extended)),
-        ));
+        steps.push(KeyStep {
+            delay_ms: delay,
+            event: InputEvent::KeyUp(key_up_code(stroke.make, stroke.extended)),
+        });
         delay = COMBO_DELAY_MS;
     }
-    Ok(events)
-}
-
-/// Body of `SPICE_MSGC_INPUTS_MOUSE_POSITION`: `x u32, y u32, buttons_state u16,
-/// display_id u8`. `display_id` is 0: we only ever drive the primary display.
-pub fn mouse_position_payload(x: u32, y: u32, buttons: u16) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(11);
-    payload.extend_from_slice(&x.to_le_bytes());
-    payload.extend_from_slice(&y.to_le_bytes());
-    payload.extend_from_slice(&buttons.to_le_bytes());
-    payload.push(0);
-    payload
-}
-
-/// Body of `SPICE_MSGC_INPUTS_MOUSE_MOTION`: `dx i32, dy i32, buttons_state u16`.
-pub fn mouse_motion_payload(dx: i32, dy: i32, buttons: u16) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(10);
-    payload.extend_from_slice(&dx.to_le_bytes());
-    payload.extend_from_slice(&dy.to_le_bytes());
-    payload.extend_from_slice(&buttons.to_le_bytes());
-    payload
-}
-
-/// The `mouse_button` value for a [`Button`].
-pub fn button_code(button: Button) -> u8 {
-    match button {
-        Button::Left => SPICE_MOUSE_BUTTON_LEFT,
-        Button::Middle => SPICE_MOUSE_BUTTON_MIDDLE,
-        Button::Right => SPICE_MOUSE_BUTTON_RIGHT,
-    }
-}
-
-/// The `mouse_button_mask` bit for a [`Button`].
-pub fn button_mask(button: Button) -> u16 {
-    button_mask_for_code(button_code(button))
-}
-
-/// The `mouse_button_mask` bit for a raw button number (1 = left … 5 = wheel down).
-/// A wheel button has no [`Button`] variant, so `mouse_scroll` needs this path.
-pub fn button_mask_for_code(button: u8) -> u16 {
-    if button >= 1 && button <= 16 {
-        1u16 << (button - 1)
-    } else {
-        0
-    }
-}
-
-/// Body of `SPICE_MSGC_INPUTS_MOUSE_PRESS`: `button u8, buttons_state u16`.
-pub fn mouse_press_payload(button: Button, buttons: u16) -> Vec<u8> {
-    mouse_press_code_payload(button_code(button), buttons)
-}
-
-/// Body of `SPICE_MSGC_INPUTS_MOUSE_RELEASE`: `button u8, buttons_state u16`.
-pub fn mouse_release_payload(button: Button, buttons: u16) -> Vec<u8> {
-    mouse_release_code_payload(button_code(button), buttons)
-}
-
-/// `SPICE_MSGC_INPUTS_MOUSE_PRESS` for a raw button number, used for the wheel
-/// buttons ([`SPICE_MOUSE_BUTTON_UP`] / [`SPICE_MOUSE_BUTTON_DOWN`]).
-pub fn mouse_press_code_payload(button: u8, buttons: u16) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(3);
-    payload.push(button);
-    payload.extend_from_slice(&buttons.to_le_bytes());
-    payload
-}
-
-/// `SPICE_MSGC_INPUTS_MOUSE_RELEASE` for a raw button number.
-pub fn mouse_release_code_payload(button: u8, buttons: u16) -> Vec<u8> {
-    mouse_press_code_payload(button, buttons)
+    Ok(steps)
 }
 
 #[cfg(test)]
@@ -694,9 +568,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn code_of(event: &InputEvent) -> u32 {
-        assert_eq!(event.2.len(), 4, "key payloads are a u32");
-        u32::from_le_bytes([event.2[0], event.2[1], event.2[2], event.2[3]])
+    /// Scancode of a key step, whichever direction it goes.
+    fn code_of(step: &KeyStep) -> u32 {
+        match step.event {
+            InputEvent::KeyDown(code) | InputEvent::KeyUp(code) => code,
+            ref other => panic!("not a key event: {:?}", other),
+        }
+    }
+
+    fn is_down(step: &KeyStep) -> bool {
+        matches!(step.event, InputEvent::KeyDown(_))
+    }
+
+    fn is_up(step: &KeyStep) -> bool {
+        matches!(step.event, InputEvent::KeyUp(_))
     }
 
     #[test]
@@ -802,72 +687,69 @@ mod tests {
 
     #[test]
     fn types_hello_world() {
-        let events = try_type_text_events("Hello World!", 25).expect("typeable");
+        let steps = type_text_events("Hello World!", 25).expect("typeable");
         // H, W and ! are shifted (4 events each); the other 9 characters are 2 each.
-        assert_eq!(events.len(), 3 * 4 + 9 * 2);
+        assert_eq!(steps.len(), 3 * 4 + 9 * 2);
 
         // First event: Shift down for 'H' at once.
-        assert_eq!(events[0].0, 0);
-        assert_eq!(events[0].1, SPICE_MSGC_INPUTS_KEY_DOWN);
-        assert_eq!(code_of(&events[0]), key_down_code(SCAN_SHIFT_LEFT, false));
-        assert_eq!(code_of(&events[1]), key_down_code(0x23, false)); // KeyH
-        assert_eq!(events[1].0, SHIFT_SETTLE_MS);
-        assert_eq!(events[1].1, SPICE_MSGC_INPUTS_KEY_DOWN);
-        assert_eq!(events[2].1, SPICE_MSGC_INPUTS_KEY_UP);
-        assert_eq!(code_of(&events[2]), key_up_code(0x23, false));
-        assert_eq!(events[3].1, SPICE_MSGC_INPUTS_KEY_UP);
-        assert_eq!(code_of(&events[3]), key_up_code(SCAN_SHIFT_LEFT, false));
+        assert_eq!(steps[0].delay_ms, 0);
+        assert!(is_down(&steps[0]));
+        assert_eq!(code_of(&steps[0]), key_down_code(SCAN_SHIFT_LEFT, false));
+        assert_eq!(code_of(&steps[1]), key_down_code(0x23, false)); // KeyH
+        assert_eq!(steps[1].delay_ms, SHIFT_SETTLE_MS);
+        assert!(is_down(&steps[1]));
+        assert!(is_up(&steps[2]));
+        assert_eq!(code_of(&steps[2]), key_up_code(0x23, false));
+        assert!(is_up(&steps[3]));
+        assert_eq!(code_of(&steps[3]), key_up_code(SCAN_SHIFT_LEFT, false));
 
         // 'e' is plain and starts after the caller's interval.
-        assert_eq!(events[4].0, 25);
-        assert_eq!(events[4].1, SPICE_MSGC_INPUTS_KEY_DOWN);
-        assert_eq!(code_of(&events[4]), key_down_code(0x12, false)); // KeyE
-        assert_eq!(events[5].0, KEY_HOLD_MS);
-        assert_eq!(code_of(&events[5]), key_up_code(0x12, false));
+        assert_eq!(steps[4].delay_ms, 25);
+        assert!(is_down(&steps[4]));
+        assert_eq!(code_of(&steps[4]), key_down_code(0x12, false)); // KeyE
+        assert_eq!(steps[5].delay_ms, KEY_HOLD_MS);
+        assert_eq!(code_of(&steps[5]), key_up_code(0x12, false));
 
         // Last character '!': Shift + Digit1.
-        let tail = &events[events.len() - 4..];
-        assert_eq!(tail[0].0, 25);
+        let tail = &steps[steps.len() - 4..];
+        assert_eq!(tail[0].delay_ms, 25);
         assert_eq!(code_of(&tail[0]), key_down_code(SCAN_SHIFT_LEFT, false));
         assert_eq!(code_of(&tail[1]), key_down_code(0x02, false)); // Digit1
         assert_eq!(code_of(&tail[2]), key_up_code(0x02, false));
         assert_eq!(code_of(&tail[3]), key_up_code(SCAN_SHIFT_LEFT, false));
-
-        // No event is ever an empty payload.
-        assert!(events.iter().all(|e| !e.2.is_empty()));
     }
 
     #[test]
     fn interval_is_floored_for_the_guest() {
-        let events = try_type_text_events("ab", 0).expect("typeable");
-        assert_eq!(events[0].0, 0);
+        let steps = type_text_events("ab", 0).expect("typeable");
+        assert_eq!(steps[0].delay_ms, 0);
         // The second character still waits the floor, not zero.
-        assert_eq!(events[2].0, MIN_TYPE_INTERVAL_MS);
+        assert_eq!(steps[2].delay_ms, MIN_TYPE_INTERVAL_MS);
     }
 
     #[test]
     fn carriage_returns_become_enter() {
         // The CRLF collapses to one newline: "a\nb\nc", five characters.
-        let events = try_type_text_events("a\r\nb\rc", 20).expect("typeable");
-        assert_eq!(events.len(), 5 * 2);
+        let steps = type_text_events("a\r\nb\rc", 20).expect("typeable");
+        assert_eq!(steps.len(), 5 * 2);
         // Enter is 0x1C make / 0x9C break, twice.
-        assert_eq!(code_of(&events[2]), key_down_code(0x1C, false));
-        assert_eq!(code_of(&events[3]), key_up_code(0x1C, false));
-        assert_eq!(code_of(&events[6]), key_down_code(0x1C, false));
-        assert_eq!(code_of(&events[7]), key_up_code(0x1C, false));
-        assert_eq!(events[3].1, SPICE_MSGC_INPUTS_KEY_UP);
-        assert_eq!(code_of(&events[4]), key_down_code(0x30, false)); // KeyB
+        assert_eq!(code_of(&steps[2]), key_down_code(0x1C, false));
+        assert_eq!(code_of(&steps[3]), key_up_code(0x1C, false));
+        assert_eq!(code_of(&steps[6]), key_down_code(0x1C, false));
+        assert_eq!(code_of(&steps[7]), key_up_code(0x1C, false));
+        assert!(is_up(&steps[3]));
+        assert_eq!(code_of(&steps[4]), key_down_code(0x30, false)); // KeyB
     }
 
     #[test]
     fn non_ascii_is_rejected() {
-        let err = try_type_text_events("caf\u{e9}", 20).expect_err("must reject");
+        let err = type_text_events("caf\u{e9}", 20).expect_err("must reject");
         assert!(
             err.contains("U+00E9"),
             "error should name the character: {err}"
         );
-        assert!(type_text_events("caf\u{e9}", 20).is_empty());
         assert!(char_to_scancode('\u{4e2d}').is_err());
+        assert!(key_combo_events("ctrl+\u{4e2d}").is_err());
     }
 
     #[test]
@@ -932,9 +814,9 @@ mod tests {
 
     #[test]
     fn combo_ctrl_alt_t() {
-        let events = key_combo_events("ctrl+alt+t").expect("valid combo");
-        assert_eq!(events.len(), 6);
-        let codes: Vec<u32> = events.iter().map(code_of).collect();
+        let steps = key_combo_events("ctrl+alt+t").expect("valid combo");
+        assert_eq!(steps.len(), 6);
+        let codes: Vec<u32> = steps.iter().map(code_of).collect();
         assert_eq!(
             codes,
             vec![
@@ -946,10 +828,10 @@ mod tests {
                 key_up_code(0x1D, false),
             ]
         );
-        assert_eq!(events[0].1, SPICE_MSGC_INPUTS_KEY_DOWN);
-        assert_eq!(events[5].1, SPICE_MSGC_INPUTS_KEY_UP);
+        assert!(is_down(&steps[0]));
+        assert!(is_up(&steps[5]));
         assert_eq!(
-            events.iter().map(|e| e.0).collect::<Vec<u16>>(),
+            steps.iter().map(|step| step.delay_ms).collect::<Vec<u16>>(),
             vec![
                 0,
                 COMBO_DELAY_MS,
@@ -963,22 +845,22 @@ mod tests {
 
     #[test]
     fn combo_accepts_codes_and_symbols() {
-        let events = key_combo_events("ArrowUp").expect("valid combo");
-        assert_eq!(events.len(), 2);
-        assert_eq!(code_of(&events[0]), 0x48E0);
-        assert_eq!(code_of(&events[1]), 0xC8E0);
+        let steps = key_combo_events("ArrowUp").expect("valid combo");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(code_of(&steps[0]), 0x48E0);
+        assert_eq!(code_of(&steps[1]), 0xC8E0);
 
         // '!' needs Shift on a US layout, so it is added for the caller.
-        let events = key_combo_events("!").expect("valid combo");
-        assert_eq!(events.len(), 4);
-        assert_eq!(code_of(&events[0]), key_down_code(SCAN_SHIFT_LEFT, false));
-        assert_eq!(code_of(&events[1]), key_down_code(0x02, false));
-        assert_eq!(code_of(&events[2]), key_up_code(0x02, false));
-        assert_eq!(code_of(&events[3]), key_up_code(SCAN_SHIFT_LEFT, false));
+        let steps = key_combo_events("!").expect("valid combo");
+        assert_eq!(steps.len(), 4);
+        assert_eq!(code_of(&steps[0]), key_down_code(SCAN_SHIFT_LEFT, false));
+        assert_eq!(code_of(&steps[1]), key_down_code(0x02, false));
+        assert_eq!(code_of(&steps[2]), key_up_code(0x02, false));
+        assert_eq!(code_of(&steps[3]), key_up_code(SCAN_SHIFT_LEFT, false));
 
         // An explicit shift is not duplicated.
-        let events = key_combo_events("shift+!").expect("valid combo");
-        assert_eq!(events.len(), 4);
+        let steps = key_combo_events("shift+!").expect("valid combo");
+        assert_eq!(steps.len(), 4);
     }
 
     #[test]
@@ -992,67 +874,5 @@ mod tests {
         );
         let err = key_combo_events("").expect_err("empty combo");
         assert!(err.contains("empty key name"), "{err}");
-    }
-
-    #[test]
-    fn mouse_payloads_are_little_endian() {
-        assert_eq!(
-            mouse_position_payload(0x0102_0304, 0x0506_0708, 0x090A),
-            vec![0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0A, 0x09, 0x00]
-        );
-        assert_eq!(mouse_position_payload(10, 20, 0).len(), 11);
-
-        // Negative deltas stay two's complement on the wire.
-        assert_eq!(
-            mouse_motion_payload(-1, -2, 1),
-            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0x01, 0x00]
-        );
-        assert_eq!(mouse_motion_payload(10, 20, 0).len(), 10);
-
-        assert_eq!(
-            mouse_press_payload(Button::Left, SPICE_MOUSE_BUTTON_MASK_LEFT),
-            vec![1, 1, 0]
-        );
-        assert_eq!(
-            mouse_release_payload(Button::Right, 0),
-            vec![SPICE_MOUSE_BUTTON_RIGHT, 0, 0]
-        );
-        assert_eq!(
-            mouse_press_code_payload(SPICE_MOUSE_BUTTON_UP, 0),
-            vec![4, 0, 0]
-        );
-        assert_eq!(
-            mouse_release_code_payload(SPICE_MOUSE_BUTTON_DOWN, 0),
-            vec![5, 0, 0]
-        );
-    }
-
-    #[test]
-    fn button_mapping() {
-        assert_eq!(button_code(Button::Left), SPICE_MOUSE_BUTTON_LEFT);
-        assert_eq!(button_code(Button::Middle), SPICE_MOUSE_BUTTON_MIDDLE);
-        assert_eq!(button_code(Button::Right), SPICE_MOUSE_BUTTON_RIGHT);
-        assert_eq!(button_mask(Button::Left), SPICE_MOUSE_BUTTON_MASK_LEFT);
-        assert_eq!(button_mask(Button::Middle), SPICE_MOUSE_BUTTON_MASK_MIDDLE);
-        assert_eq!(button_mask(Button::Right), SPICE_MOUSE_BUTTON_MASK_RIGHT);
-        assert_eq!(
-            button_mask_for_code(SPICE_MOUSE_BUTTON_UP),
-            SPICE_MOUSE_BUTTON_MASK_UP
-        );
-        assert_eq!(
-            button_mask_for_code(SPICE_MOUSE_BUTTON_DOWN),
-            SPICE_MOUSE_BUTTON_MASK_DOWN
-        );
-        assert_eq!(button_mask_for_code(0), 0);
-    }
-
-    #[test]
-    fn message_type_values_match_enums_h() {
-        assert_eq!(SPICE_MSGC_INPUTS_KEY_DOWN, 101);
-        assert_eq!(SPICE_MSGC_INPUTS_KEY_UP, 102);
-        assert_eq!(SPICE_MSGC_INPUTS_MOUSE_MOTION, 111);
-        assert_eq!(SPICE_MSGC_INPUTS_MOUSE_POSITION, 112);
-        assert_eq!(SPICE_MSGC_INPUTS_MOUSE_PRESS, 113);
-        assert_eq!(SPICE_MSGC_INPUTS_MOUSE_RELEASE, 114);
     }
 }
