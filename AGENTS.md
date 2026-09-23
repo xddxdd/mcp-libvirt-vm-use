@@ -18,8 +18,13 @@ src/
 
 docs/                SPICE 协议权威参考（spice.proto、spice-protocol 头文件、
                      spice-html5 参考实现；手写协议客户端已被 ryll crates 取代）
+README.md            英文使用说明：依赖、构建运行、MCP 客户端配置、8 个 tools
+LICENSE              GPL-3.0-only 全文
 PLAN.md              约束性契约：模块 API 签名、crate 选型、迁移决策
-flake.nix            flake-parts devShell（rustc / cargo / pkg-config / libvirt）
+flake.nix            flake-parts：devShell（rustc / cargo / pkg-config / libvirt）
+                     + packages.default（callPackage ./default.nix）
+default.nix          非 flake 入口：`nix-build ./default.nix`，用 `<nixpkgs>`
+                     定义 rustPlatform.buildRustPackage 包（flake 也复用它）
 ```
 
 
@@ -33,7 +38,19 @@ nix develop -c cargo test
 nix develop -c cargo run
 ```
 
+打包与运行整包：`nix build`（产物在 `./result/bin/mcp-libvirt-vm-use`）、`nix run`。
+非 flake 用户用 `nix-build ./default.nix`，与 flake 共用同一个 derivation。
+打包走 `rustPlatform.buildRustPackage`，`cargoLock.lockFile = ./Cargo.lock`，check phase 会跑全部 47 个单元测试。
+
 宿主机 rustup 的 ld shim 损坏时，裸 cargo 链接需 `RUSTFLAGS="-C link-arg=-fuse-ld=bfd"`；devShell 内的 nixpkgs rustc 无此问题。
+
+## 运行时配置
+
+libvirt 连接 URI 读自 `LIBVIRT_DEFAULT_URI`，未设置时回退 `qemu:///system`；启动时把最终 URI 打到 stderr。
+
+## 许可证
+
+GPL-3.0-only。声明位置：`LICENSE` 全文、`Cargo.toml` 的 `license` 字段、flake `meta.license = lib.licenses.gpl3Only`。
 
 ## 开发规则
 
