@@ -35,7 +35,7 @@ File ownership is disjoint: **A** owns main.rs, mcp.rs, libvirt.rs, tools.rs, Ca
 **B** owns spice/mod.rs, spice/proto.rs, spice/link.rs;
 **C** owns spice/inputs.rs, spice/display.rs.
 
-## Public API contracts (MUST match exactly across workers)
+## Public API contracts (HISTORICAL — pre-migration; the sync `spice::` section below is superseded by "Migration v2" above: methods are now async and implemented over shakenfist-spice-renderer. The libvirt/tools contracts are unchanged and still binding.)
 
 ```rust
 // libvirt.rs
