@@ -362,6 +362,70 @@ Workers A/B/C must NOT modify it. If you believe a dependency or feature is miss
 say so in your report instead of editing it.
 
 
+
+## Migration v2 (current): ryll/shakenfist SPICE crates replace the hand-written client
+
+Operator decision (evaluated spice-client (GPL-3, single-maintainer) vs shakenfist/ryll
+(Apache-2.0, active, complete): adopt the **shakenfist-spice-renderer 0.1.7** ecosystem.
+`src/spice/{proto,link,inputs,display}.rs` are deleted; `src/spice/mod.rs` becomes a thin
+async adapter. `libvirt.rs`, the MCP tool surface, and the tool semantics are unchanged.
+
+### Pinned API facts (verified against the PUBLISHED 0.1.7 vendored at
+`~/.cargo/registry/src/index.crates.io-*/shakenfist-spice-renderer-0.1.7`)
+
+- `shakenfist_spice_protocol::{ChannelType, ConnectionConfig, SpiceClient}`;
+  `ConnectionConfig { host: String, port: u16, tls_port: Option<u16>, password: Option<String>, ca_cert: Option<String>, host_subject: Option<String> }` (TCP/TLS only).
+- Renderer re-exports: `run_connection, run_headless, ChannelEvent, InputEvent, SurfaceMirror,
+  DisplaySurface, ByteCounter, TrafficSink, LogConfig, ChannelSnapshots, CaptureSink, UsbCommand,
+  WebdavCommand, VirtualDiskConfig, ShareDirConfig, ClipboardBackend` (lib.rs).
+- `run_connection(config, event_tx: mpsc::Sender<ChannelEvent>, repaint_notify: Arc<Notify>,
+  input_rx: mpsc::Receiver<InputEvent>, usb_rx, webdav_rx, virtual_disks: Vec<VirtualDiskConfig>,
+  share_dir: Option<ShareDirConfig>, capture: Option<Arc<dyn CaptureSink>>,
+  byte_counter: Arc<ByteCounter>, traffic: Arc<dyn TrafficSink>, snapshots: ChannelSnapshots,
+  monitors: u8, resize_rx: mpsc::Receiver<(u32,u32)>, volume_control: Arc<VolumeControl>,
+  enable_paste: bool, log_config: LogConfig, cancel: Arc<AtomicBool>,
+  clipboard: Option<Arc<dyn ClipboardBackend>>) -> Result<()>` — spawns one task per channel;
+  returns when all channel tasks exit.
+- `InputEvent` (channels/mod.rs): `KeyDown(u32)/KeyUp(u32)` (wire scancode incl. 0xE0 ext),
+  `MouseMove{x,y}`, `MouseMotion{dx,dy}`, `MouseDown{button,x,y}`, `MouseUp{button,x,y}` (button
+  u32: 1..5 SPICE), `Paste{text, request_id, cancel, char_delay?}` (US-QWERTY synth — verify exact
+  fields in vendored source), and `VirtualDiskUsbUpdate`/resize variants — check the enum.
+- `SurfaceMirror::apply_event(&ChannelEvent)`, `primary_surface() -> Option<&DisplaySurface>`;
+  `DisplaySurface { id, width: u32, height: u32, .. }` with `pub fn pixels(&self) -> &[u8]` (RGBA).
+- `VolumeControl` re-exported from `channels::volume` (NOT audio-gated) — construct with
+  `VolumeControl::new()`; `ByteCounter::new()`, `ChannelSnapshots`/`LogConfig` presumably
+  `Default` — verify in vendored source.
+- Features: `default = ["audio"]`; we build with `default-features = false` (drops cpal/opus/rtrb).
+  USB-redir/WebDAV/openh264/hyper deps are unconditional — accepted (heavy tree, operator approved).
+
+### Adapter contract (src/spice/mod.rs, async)
+
+- `SpiceSession` becomes an async facade over one `run_connection` tokio task:
+  `SpiceSession::connect(ep: &SpiceEndpoint, password: &str)` → for `SpiceEndpoint::Tcp{host,port}`
+  build `ConnectionConfig`; **`SpiceEndpoint::Unix` → Err("unix-socket SPICE endpoints are not
+  supported by the ryll-based client")** (regression accepted; all host VMs are TCP).
+  On connect: spawn `run_connection`, drain `event_rx` in a task applying every event to an owned
+  `SurfaceMirror`, wait for `ChannelEvent::SessionInitialized`/`ChannelsAvailable` (verify exact
+  variant names) with a 5s deadline.
+- Methods become async: `screenshot(wait_ms)`, `type_text(text, interval_ms)`, `key_press(combo)`,
+  `mouse_move`, `mouse_click`, `mouse_scroll`, `mouse_drag`; `Button`/`ScrollDir`/`PngImage{width,
+  height, png: Vec<u8>}` stay identical. Screenshot: wait for a complete frame + quiet period
+  (reuse old deadline logic: cap 5s, quiet `wait_ms`), then `mirror.primary_surface()` → RGBA →
+  encode 8-bit RGB PNG with the `image` crate. type_text: use `InputEvent::Paste` (US-QWERTY
+  synth with per-char delay) if its semantics fit, else stream KeyDown/KeyUp from our verified
+  scancode table; non-ASCII still rejected with a clear error. key_press combos: keep the old
+  key-name→scancode table (port `key_name_to_scancode` + combo alias list + its unit tests into
+  mod.rs or a slim `inputs.rs`).
+- `src/tools.rs` + `src/mcp.rs`: SPICE operations become async and are awaited directly in the
+  rmcp handlers; the libvirt FFI parts (Connect::open, lookups, XML) STAY inside
+  `tokio::task::spawn_blocking` (virt crate is sync FFI). The `blocking()` helper shrinks to
+  wrapping only the libvirt resolution step, or is split per tool.
+
+### Cargo.toml (parent-managed, already updated)
+
+Removed: png, rsa, sha1, rand. Added: `shakenfist-spice-renderer 0.1.7 (no default features)`,
+`shakenfist-spice-protocol 0.1.7`, `image 0.25 (png feature only)`.
+
 ## Task decomposition (delegated implementation)
 
 - **Worker A — scaffold + MCP (rmcp) + libvirt (virt crate) + tools** (files: src/main.rs,
