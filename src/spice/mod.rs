@@ -43,6 +43,9 @@ const SCREENSHOT_POLL: Duration = Duration::from_millis(25);
 
 /// Gap between the events of one click or key press.
 const EVENT_GAP: Duration = Duration::from_millis(15);
+/// Allow the renderer's inputs task to drain the last queued keystroke before
+/// Drop cancels the connection. The renderer checks cancellation every 100 ms.
+const KEY_DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// Gap after positioning the pointer before pressing a button.
 const CLICK_GAP: Duration = Duration::from_millis(20);
 /// Gap between the two clicks of a double click.
@@ -516,6 +519,11 @@ impl SpiceSession {
             }
             self.send(step.event.clone()).await?;
         }
+        if !steps.is_empty() {
+            // mpsc::Sender::send only queues the event. Dropping this session
+            // immediately can abort the inputs task before it writes the final key.
+            tokio::time::sleep(KEY_DRAIN_GRACE).await;
+        }
         Ok(())
     }
 
@@ -692,6 +700,34 @@ mod tests {
 
         state.apply(&ChannelEvent::MouseMode(1));
         assert_eq!(state.mouse_mode, Some(1));
+    }
+
+    #[tokio::test]
+    async fn keyboard_stream_waits_for_a_slow_inputs_consumer() {
+        let (input_tx, mut input_rx) = mpsc::channel(10);
+        let mut session = SpiceSession {
+            endpoint: "test:5900".to_string(),
+            input_tx,
+            state: Arc::new(Mutex::new(SessionState::new())),
+            cancel: Arc::new(AtomicBool::new(false)),
+            pointer_x: 0,
+            pointer_y: 0,
+        };
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let down = input_rx.recv().await.expect("Enter down");
+            let up = input_rx.recv().await.expect("Enter up");
+            (down, up)
+        });
+        let steps = inputs::type_text_events("\n", 10).unwrap();
+        session.stream_keys(&steps).await.unwrap();
+        assert!(
+            consumer.is_finished(),
+            "session returned before the final Enter was consumed"
+        );
+        let (down, up) = consumer.await.unwrap();
+        assert!(matches!(down, InputEvent::KeyDown(0x1C)));
+        assert!(matches!(up, InputEvent::KeyUp(0x9C)));
     }
 
     #[test]
