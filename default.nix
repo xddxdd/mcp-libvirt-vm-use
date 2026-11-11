@@ -16,7 +16,10 @@ pkgs.rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   nativeBuildInputs = [ pkgs.pkg-config ];
-  buildInputs = [ pkgs.libvirt ];
+  buildInputs = [
+    pkgs.libvirt
+    pkgs.aws-lc
+  ];
 
   meta = {
     description = "MCP server that drives libvirt domains over SPICE";
